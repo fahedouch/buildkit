@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/docker/docker/pkg/locker"
 	"github.com/moby/buildkit/cache"
@@ -22,6 +21,7 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/secrets"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/source"
 	"github.com/moby/buildkit/util/progress/logs"
 	"github.com/pkg/errors"
@@ -167,7 +167,7 @@ func (gs *gitSourceHandler) shaToCacheKey(sha string) string {
 	return key
 }
 
-func (gs *gitSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager) (source.SourceInstance, error) {
+func (gs *gitSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager, _ solver.Vertex) (source.SourceInstance, error) {
 	gitIdentifier, ok := id.(*source.GitIdentifier)
 	if !ok {
 		return nil, errors.Errorf("invalid git identifier %v", id)
@@ -205,7 +205,7 @@ func (gs *gitSourceHandler) authSecretNames() (sec []authSecret, _ error) {
 	return sec, nil
 }
 
-func (gs *gitSourceHandler) getAuthToken(ctx context.Context) error {
+func (gs *gitSourceHandler) getAuthToken(ctx context.Context, g session.Group) error {
 	if gs.auth != nil {
 		return nil
 	}
@@ -213,38 +213,26 @@ func (gs *gitSourceHandler) getAuthToken(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	id := session.FromContext(ctx)
-	if id == "" {
-		return errors.New("could not access auth tokens without session")
-	}
-
-	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	caller, err := gs.sm.Get(timeoutCtx, id)
-	if err != nil {
-		return err
-	}
-
-	for _, s := range sec {
-		dt, err := secrets.GetSecret(ctx, caller, s.name)
-		if err != nil {
-			if errors.Is(err, secrets.ErrNotFound) {
-				continue
+	return gs.sm.Any(ctx, g, func(ctx context.Context, _ string, caller session.Caller) error {
+		for _, s := range sec {
+			dt, err := secrets.GetSecret(ctx, caller, s.name)
+			if err != nil {
+				if errors.Is(err, secrets.ErrNotFound) {
+					continue
+				}
+				return err
 			}
-			return err
+			if s.token {
+				dt = []byte("basic " + base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("x-access-token:%s", dt))))
+			}
+			gs.auth = []string{"-c", "http.extraheader=Authorization: " + string(dt)}
+			break
 		}
-		if s.token {
-			dt = []byte("basic " + base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("x-access-token:%s", dt))))
-		}
-		gs.auth = []string{"-c", "http.extraheader=Authorization: " + string(dt)}
-		break
-	}
-
-	return nil
+		return nil
+	})
 }
 
-func (gs *gitSourceHandler) CacheKey(ctx context.Context, index int) (string, bool, error) {
+func (gs *gitSourceHandler) CacheKey(ctx context.Context, g session.Group, index int) (string, solver.CacheOpts, bool, error) {
 	remote := gs.src.Remote
 	ref := gs.src.Ref
 	if ref == "" {
@@ -256,14 +244,14 @@ func (gs *gitSourceHandler) CacheKey(ctx context.Context, index int) (string, bo
 	if isCommitSHA(ref) {
 		ref = gs.shaToCacheKey(ref)
 		gs.cacheKey = ref
-		return ref, true, nil
+		return ref, nil, true, nil
 	}
 
-	gs.getAuthToken(ctx)
+	gs.getAuthToken(ctx, g)
 
 	gitDir, unmountGitDir, err := gs.mountRemote(ctx, remote, gs.auth)
 	if err != nil {
-		return "", false, err
+		return "", nil, false, err
 	}
 	defer unmountGitDir()
 
@@ -271,24 +259,24 @@ func (gs *gitSourceHandler) CacheKey(ctx context.Context, index int) (string, bo
 
 	buf, err := gitWithinDir(ctx, gitDir, "", gs.auth, "ls-remote", "origin", ref)
 	if err != nil {
-		return "", false, errors.Wrapf(err, "failed to fetch remote %s", remote)
+		return "", nil, false, errors.Wrapf(err, "failed to fetch remote %s", remote)
 	}
 	out := buf.String()
 	idx := strings.Index(out, "\t")
 	if idx == -1 {
-		return "", false, errors.Errorf("repository does not contain ref %s, output: %q", ref, string(out))
+		return "", nil, false, errors.Errorf("repository does not contain ref %s, output: %q", ref, string(out))
 	}
 
 	sha := string(out[:idx])
 	if !isCommitSHA(sha) {
-		return "", false, errors.Errorf("invalid commit sha %q", sha)
+		return "", nil, false, errors.Errorf("invalid commit sha %q", sha)
 	}
 	sha = gs.shaToCacheKey(sha)
 	gs.cacheKey = sha
-	return sha, true, nil
+	return sha, nil, true, nil
 }
 
-func (gs *gitSourceHandler) Snapshot(ctx context.Context) (out cache.ImmutableRef, retErr error) {
+func (gs *gitSourceHandler) Snapshot(ctx context.Context, g session.Group) (out cache.ImmutableRef, retErr error) {
 	ref := gs.src.Ref
 	if ref == "" {
 		ref = "master"
@@ -297,13 +285,13 @@ func (gs *gitSourceHandler) Snapshot(ctx context.Context) (out cache.ImmutableRe
 	cacheKey := gs.cacheKey
 	if cacheKey == "" {
 		var err error
-		cacheKey, _, err = gs.CacheKey(ctx, 0)
+		cacheKey, _, _, err = gs.CacheKey(ctx, g, 0)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	gs.getAuthToken(ctx)
+	gs.getAuthToken(ctx, g)
 
 	snapshotKey := "git-snapshot::" + cacheKey + ":" + gs.src.Subdir
 	gs.locker.Lock(snapshotKey)

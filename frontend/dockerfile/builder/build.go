@@ -53,10 +53,11 @@ const (
 	keyNameDockerfile          = "dockerfilekey"
 	keyContextSubDir           = "contextsubdir"
 	keyContextKeepGitDir       = "build-arg:BUILDKIT_CONTEXT_KEEP_GIT_DIR"
+	keySyntax                  = "build-arg:BUILDKIT_SYNTAX"
 )
 
 var httpPrefix = regexp.MustCompile(`^https?://`)
-var gitUrlPathWithFragmentSuffix = regexp.MustCompile(`\.git(?:#.+)?$`)
+var gitURLPathWithFragmentSuffix = regexp.MustCompile(`\.git(?:#.+)?$`)
 
 func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	opts := c.BuildOpts().Opts
@@ -164,7 +165,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 			},
 		})
 		if err != nil {
-			return nil, errors.Errorf("failed to read downloaded context")
+			return nil, errors.Wrapf(err, "failed to read downloaded context")
 		}
 		if isArchive(dt) {
 			if fileop {
@@ -317,8 +318,14 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	}
 
 	if _, ok := opts["cmdline"]; !ok {
-		ref, cmdline, loc, ok := dockerfile2llb.DetectSyntax(bytes.NewBuffer(dtDockerfile))
-		if ok {
+		if cmdline, ok := opts[keySyntax]; ok {
+			p := strings.SplitN(strings.TrimSpace(cmdline), " ", 2)
+			res, err := forwardGateway(ctx, c, p[0], cmdline)
+			if err != nil && len(errdefs.Sources(err)) == 0 {
+				return nil, errors.Wrapf(err, "failed with %s = %s", keySyntax, cmdline)
+			}
+			return res, err
+		} else if ref, cmdline, loc, ok := dockerfile2llb.DetectSyntax(bytes.NewBuffer(dtDockerfile)); ok {
 			res, err := forwardGateway(ctx, c, ref, cmdline)
 			if err != nil && len(errdefs.Sources(err)) == 0 {
 				return nil, wrapSource(err, sourceMap, loc)
@@ -512,7 +519,7 @@ func filter(opt map[string]string, key string) map[string]string {
 
 func detectGitContext(ref, gitContext string) (*llb.State, bool) {
 	found := false
-	if httpPrefix.MatchString(ref) && gitUrlPathWithFragmentSuffix.MatchString(ref) {
+	if httpPrefix.MatchString(ref) && gitURLPathWithFragmentSuffix.MatchString(ref) {
 		found = true
 	}
 

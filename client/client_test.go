@@ -15,15 +15,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
+	ctderrdefs "github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/snapshots"
@@ -113,10 +114,13 @@ func TestIntegration(t *testing.T) {
 		testCacheMountNoCache,
 		testExporterTargetExists,
 		testTarExporterWithSocket,
+		testTarExporterWithSocketCopy,
 		testTarExporterSymlink,
 		testMultipleRegistryCacheImportExport,
 		testSourceMap,
 		testSourceMapFromRef,
+		testLazyImagePush,
+		testStargzLazyPull,
 	}, mirrors)
 
 	integration.Run(t, []integration.Test{
@@ -143,7 +147,7 @@ func TestIntegration(t *testing.T) {
 }
 
 func newContainerd(cdAddress string) (*containerd.Client, error) {
-	return containerd.New(cdAddress, containerd.WithTimeout(60*time.Second), containerd.WithDefaultRuntime("io.containerd.runtime.v1.linux"))
+	return containerd.New(cdAddress, containerd.WithTimeout(60*time.Second))
 }
 
 // moby/buildkit#1336
@@ -271,10 +275,7 @@ func testExportBusyboxLocal(t *testing.T, sb integration.Sandbox) {
 	fi2, err := os.Stat(filepath.Join(destDir, "bin/vi"))
 	require.NoError(t, err)
 
-	st1 := fi.Sys().(*syscall.Stat_t)
-	st2 := fi2.Sys().(*syscall.Stat_t)
-
-	require.Equal(t, st1.Ino, st2.Ino)
+	require.True(t, os.SameFile(fi, fi2))
 }
 
 func testHostnameLookup(t *testing.T, sb integration.Sandbox) {
@@ -1342,7 +1343,7 @@ func testUser(t *testing.T, sb integration.Sandbox) {
 
 	run("daemon", `sh -c "id -nu > user"`)
 	run("daemon:daemon", `sh -c "id -ng > group"`)
-	run("daemon:nogroup", `sh -c "id -ng > nogroup"`)
+	run("daemon:nobody", `sh -c "id -ng > nobody"`)
 	run("1:1", `sh -c "id -g > userone"`)
 
 	st = st.Run(llb.Shlex("cp -a /wd/. /out/"))
@@ -1373,9 +1374,9 @@ func testUser(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	require.Contains(t, string(dt), "daemon")
 
-	dt, err = ioutil.ReadFile(filepath.Join(destDir, "nogroup"))
+	dt, err = ioutil.ReadFile(filepath.Join(destDir, "nobody"))
 	require.NoError(t, err)
-	require.Contains(t, string(dt), "nogroup")
+	require.Contains(t, string(dt), "nobody")
 
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "userone"))
 	require.NoError(t, err)
@@ -1650,6 +1651,30 @@ func testTarExporterWithSocket(t *testing.T, sb integration.Sandbox) {
 			},
 		},
 	}, nil)
+	require.NoError(t, err)
+}
+
+func testTarExporterWithSocketCopy(t *testing.T, sb integration.Sandbox) {
+	if os.Getenv("TEST_DOCKERD") == "1" {
+		t.Skip("tar exporter is temporarily broken on dockerd")
+	}
+
+	requiresLinux(t)
+	c, err := New(context.TODO(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	alpine := llb.Image("docker.io/library/alpine:latest")
+	state := alpine.Run(llb.Args([]string{"sh", "-c", "nc -l -s local:/root/socket.sock & usleep 100000; kill %1"})).Root()
+
+	fa := llb.Copy(state, "/root", "/roo2", &llb.CopyInfo{})
+
+	scratchCopy := llb.Scratch().File(fa)
+
+	def, err := scratchCopy.Marshal(context.TODO())
+	require.NoError(t, err)
+
+	_, err = c.Solve(context.TODO(), def, SolveOpt{}, nil)
 	require.NoError(t, err)
 }
 
@@ -2024,6 +2049,246 @@ func testBuildPushAndValidate(t *testing.T, sb integration.Sandbox) {
 
 	_, ok = m["foo/sub/bar"]
 	require.False(t, ok)
+}
+
+func testStargzLazyPull(t *testing.T, sb integration.Sandbox) {
+	skipDockerd(t, sb)
+	requiresLinux(t)
+
+	cdAddress := sb.ContainerdAddress()
+	if cdAddress == "" || !sb.Stargz() {
+		t.Skip("test requires containerd worker with stargz snapshotter")
+	}
+
+	client, err := newContainerd(cdAddress)
+	require.NoError(t, err)
+	defer client.Close()
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrorRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	// Prepare stargz image
+	sgzImage := registry + "/stargz/alpine:latest"
+	err = exec.Command("ctr-remote", "image", "optimize",
+		"--period=1", "alpine:latest", sgzImage).Run()
+	require.NoError(t, err)
+
+	c, err := New(context.TODO(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	// stargz layers should be lazy even for executing something on them
+	def, err := llb.Image(sgzImage).
+		Run(llb.Args([]string{"/bin/touch", "/foo"})).
+		Marshal(context.TODO())
+	require.NoError(t, err)
+	target := registry + "/buildkit/testlazyimage:latest"
+	_, err = c.Solve(context.TODO(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": target,
+					"push": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	var (
+		imageService = client.ImageService()
+		contentStore = client.ContentStore()
+		ctx          = namespaces.WithNamespace(context.Background(), "buildkit")
+	)
+
+	img, err := imageService.Get(ctx, target)
+	require.NoError(t, err)
+
+	manifest, err := images.Manifest(ctx, contentStore, img.Target, nil)
+	require.NoError(t, err)
+
+	// Check if image layers are lazy.
+	// The topmost(last) layer created by `Run` isn't lazy so we skip the check for the layer.
+	var sgzLayers []ocispec.Descriptor
+	for _, layer := range manifest.Layers[:len(manifest.Layers)-1] {
+		_, err = contentStore.Info(ctx, layer.Digest)
+		require.True(t, errors.Is(err, ctderrdefs.ErrNotFound), "unexpected error %v", err)
+		sgzLayers = append(sgzLayers, layer)
+	}
+	require.NotEqual(t, 0, len(sgzLayers), "no layer can be used for checking lazypull")
+
+	// The topmost(last) layer created by `Run` shouldn't be lazy
+	_, err = contentStore.Info(ctx, manifest.Layers[len(manifest.Layers)-1].Digest)
+	require.NoError(t, err)
+
+	// clear all local state out
+	err = imageService.Delete(ctx, img.Name, images.SynchronousDelete())
+	require.NoError(t, err)
+	checkAllReleasable(t, c, sb, true)
+
+	// stargz layers should be exportable
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+	out := filepath.Join(destDir, "out.tar")
+	outW, err := os.Create(out)
+	require.NoError(t, err)
+	_, err = c.Solve(context.TODO(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:   ExporterOCI,
+				Output: fixedWriteCloser(outW),
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	// Check if image layers are un-lazied
+	for _, layer := range sgzLayers {
+		_, err = contentStore.Info(ctx, layer.Digest)
+		require.NoError(t, err)
+	}
+
+	err = c.Prune(context.TODO(), nil, PruneAll)
+	require.NoError(t, err)
+	checkAllRemoved(t, c, sb)
+}
+
+func testLazyImagePush(t *testing.T, sb integration.Sandbox) {
+	skipDockerd(t, sb)
+	requiresLinux(t)
+
+	cdAddress := sb.ContainerdAddress()
+	if cdAddress == "" {
+		t.Skip("test requires containerd worker")
+	}
+
+	client, err := newContainerd(cdAddress)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrorRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	c, err := New(context.TODO(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	// push the busybox image to the mutable registry
+	sourceImage := "busybox:latest"
+	def, err := llb.Image(sourceImage).Marshal(context.TODO())
+	require.NoError(t, err)
+
+	targetNoTag := registry + "/buildkit/testlazyimage:"
+	target := targetNoTag + "latest"
+	_, err = c.Solve(context.TODO(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": target,
+					"push": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	imageService := client.ImageService()
+	contentStore := client.ContentStore()
+
+	img, err := imageService.Get(ctx, target)
+	require.NoError(t, err)
+
+	manifest, err := images.Manifest(ctx, contentStore, img.Target, nil)
+	require.NoError(t, err)
+
+	for _, layer := range manifest.Layers {
+		_, err = contentStore.Info(ctx, layer.Digest)
+		require.NoError(t, err)
+	}
+
+	// clear all local state out
+	err = imageService.Delete(ctx, img.Name, images.SynchronousDelete())
+	require.NoError(t, err)
+	checkAllReleasable(t, c, sb, true)
+
+	// retag the image we just pushed with no actual changes, which
+	// should not result in the image getting un-lazied
+	def, err = llb.Image(target).Marshal(context.TODO())
+	require.NoError(t, err)
+
+	target2 := targetNoTag + "newtag"
+	_, err = c.Solve(context.TODO(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": target2,
+					"push": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	img, err = imageService.Get(ctx, target2)
+	require.NoError(t, err)
+
+	manifest, err = images.Manifest(ctx, contentStore, img.Target, nil)
+	require.NoError(t, err)
+
+	for _, layer := range manifest.Layers {
+		_, err = contentStore.Info(ctx, layer.Digest)
+		require.True(t, errors.Is(err, ctderrdefs.ErrNotFound), "unexpected error %v", err)
+	}
+
+	// clear all local state out again
+	err = imageService.Delete(ctx, img.Name, images.SynchronousDelete())
+	require.NoError(t, err)
+	checkAllReleasable(t, c, sb, true)
+
+	// try a cross-repo push to same registry, which should still result in the
+	// image remaining lazy
+	target3 := registry + "/buildkit/testlazycrossrepo:latest"
+	_, err = c.Solve(context.TODO(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": target3,
+					"push": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	img, err = imageService.Get(ctx, target3)
+	require.NoError(t, err)
+
+	manifest, err = images.Manifest(ctx, contentStore, img.Target, nil)
+	require.NoError(t, err)
+
+	for _, layer := range manifest.Layers {
+		_, err = contentStore.Info(ctx, layer.Digest)
+		require.True(t, errors.Is(err, ctderrdefs.ErrNotFound), "unexpected error %v", err)
+	}
+
+	// check that a subsequent build can use the previously lazy image in an exec
+	def, err = llb.Image(target2).Run(llb.Args([]string{"true"})).Marshal(context.TODO())
+	require.NoError(t, err)
+
+	_, err = c.Solve(context.TODO(), def, SolveOpt{}, nil)
+	require.NoError(t, err)
 }
 
 func testBasicCacheImportExport(t *testing.T, sb integration.Sandbox, cacheOptionsEntryImport, cacheOptionsEntryExport []CacheOptionsEntry) {
@@ -2817,8 +3082,8 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 	cmd := `sh -c "echo -n $HTTP_PROXY-$HTTPS_PROXY-$NO_PROXY-$no_proxy > env"`
 
 	st := base.Run(llb.Shlex(cmd), llb.WithProxy(llb.ProxyEnv{
-		HttpProxy:  "httpvalue",
-		HttpsProxy: "httpsvalue",
+		HTTPProxy:  "httpvalue",
+		HTTPSProxy: "httpsvalue",
 		NoProxy:    "noproxyvalue",
 	}))
 	out := st.AddMount("/out", llb.Scratch())
@@ -2846,7 +3111,7 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 
 	// repeat to make sure proxy doesn't change cache
 	st = base.Run(llb.Shlex(cmd), llb.WithProxy(llb.ProxyEnv{
-		HttpsProxy: "httpsvalue2",
+		HTTPSProxy: "httpsvalue2",
 		NoProxy:    "noproxyvalue2",
 	}))
 	out = st.AddMount("/out", llb.Scratch())

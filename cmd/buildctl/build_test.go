@@ -92,7 +92,7 @@ func testBuildContainerdExporter(t *testing.T, sb integration.Sandbox) {
 	err = cmd.Run()
 	require.NoError(t, err)
 
-	client, err := containerd.New(cdAddress, containerd.WithTimeout(60*time.Second), containerd.WithDefaultRuntime("io.containerd.runtime.v1.linux"))
+	client, err := containerd.New(cdAddress, containerd.WithTimeout(60*time.Second))
 	require.NoError(t, err)
 	defer client.Close()
 
@@ -102,7 +102,11 @@ func testBuildContainerdExporter(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	// NOTE: by default, it is overlayfs
-	ok, err := img.IsUnpacked(ctx, "overlayfs")
+	snapshotter := "overlayfs"
+	if sb.Stargz() {
+		snapshotter = "stargz"
+	}
+	ok, err := img.IsUnpacked(ctx, snapshotter)
 	require.NoError(t, err)
 	require.Equal(t, ok, true)
 }

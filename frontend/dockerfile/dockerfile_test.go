@@ -32,9 +32,11 @@ import (
 	"github.com/moby/buildkit/frontend/dockerfile/builder"
 	"github.com/moby/buildkit/frontend/dockerfile/dockerfile2llb"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/frontend/subrequests"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/upload/uploadprovider"
+	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/testutil"
 	"github.com/moby/buildkit/util/testutil/httpserver"
@@ -101,6 +103,8 @@ var allTests = []integration.Test{
 	testFrontendUseForwardedSolveResults,
 	testFrontendInputs,
 	testErrorsSourceMap,
+	testMultiArgs,
+	testFrontendSubrequests,
 }
 
 var fileOpTests = []integration.Test{
@@ -1156,6 +1160,52 @@ COPY --from=build /out .
 	dt, err := ioutil.ReadFile(filepath.Join(destDir, "out"))
 	require.NoError(t, err)
 	require.Equal(t, "bar-box-foo", string(dt))
+}
+
+func testMultiArgs(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+ARG a1="foo bar" a2=box
+ARG a3="$a2-foo"
+FROM busy$a2 AS build
+ARG a3 a4="123 456" a1
+RUN echo -n "$a1:$a3:$a4" > /out
+FROM scratch
+COPY --from=build /out .
+`)
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	c, err := client.New(context.TODO(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+			builder.DefaultLocalNameContext:    dir,
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := ioutil.ReadFile(filepath.Join(destDir, "out"))
+	require.NoError(t, err)
+	require.Equal(t, "foo bar:box-foo:123 456", string(dt))
 }
 
 func testExportMultiPlatform(t *testing.T, sb integration.Sandbox) {
@@ -4636,6 +4686,85 @@ COPY foo foo2
 	actual, err := ioutil.ReadFile(filepath.Join(destDir, "foo2"))
 	require.NoError(t, err)
 	require.Equal(t, expected, actual)
+}
+
+func testFrontendSubrequests(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	c, err := client.New(context.TODO(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	dockerfile := []byte(`
+FROM scratch
+COPY Dockerfile Dockerfile
+`)
+
+	if gf, ok := f.(*gatewayFrontend); ok {
+		dockerfile = []byte(fmt.Sprintf("#syntax=%s\n\n%s", gf.gw, dockerfile))
+	}
+
+	dir, err := tmpdir(
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	called := false
+
+	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		reqs, err := subrequests.Describe(ctx, c)
+		require.NoError(t, err)
+
+		require.True(t, len(reqs) > 0)
+
+		hasDescribe := false
+
+		for _, req := range reqs {
+			if req.Name == "frontend.subrequests.describe" {
+				hasDescribe = true
+				require.Equal(t, subrequests.RequestType("rpc"), req.Type)
+				require.NotEqual(t, req.Version, "")
+				require.True(t, len(req.Metadata) > 0)
+			}
+		}
+		require.True(t, hasDescribe)
+
+		_, err = c.Solve(ctx, gateway.SolveRequest{
+			FrontendOpt: map[string]string{
+				"requestid":     "frontend.subrequests.notexist",
+				"frontend.caps": "moby.buildkit.frontend.subrequests",
+			},
+			Frontend: "dockerfile.v0",
+		})
+		require.Error(t, err)
+		var reqErr *errdefs.UnsupportedSubrequestError
+		require.True(t, errors.As(err, &reqErr))
+		require.Equal(t, "frontend.subrequests.notexist", reqErr.GetName())
+
+		_, err = c.Solve(ctx, gateway.SolveRequest{
+			FrontendOpt: map[string]string{
+				"frontend.caps": "moby.buildkit.frontend.notexistcap",
+			},
+			Frontend: "dockerfile.v0",
+		})
+		require.Error(t, err)
+		var capErr *errdefs.UnsupportedFrontendCapError
+		require.True(t, errors.As(err, &capErr))
+		require.Equal(t, "moby.buildkit.frontend.notexistcap", capErr.GetName())
+
+		called = true
+		return nil, nil
+	}
+
+	_, err = c.Build(context.TODO(), client.SolveOpt{
+		LocalDirs: map[string]string{
+			builder.DefaultLocalNameDockerfile: dir,
+		},
+	}, "", frontend, nil)
+	require.NoError(t, err)
+
+	require.True(t, called)
 }
 
 func tmpdir(appliers ...fstest.Applier) (string, error) {

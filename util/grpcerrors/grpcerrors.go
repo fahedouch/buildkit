@@ -33,8 +33,12 @@ func ToGRPC(err error) error {
 		st = status.New(Code(err), err.Error())
 	}
 	if st.Code() != Code(err) {
+		code := Code(err)
+		if code == codes.OK {
+			code = codes.Unknown
+		}
 		pb := st.Proto()
-		pb.Code = int32(Code(err))
+		pb.Code = int32(code)
 		st = status.FromProto(pb)
 	}
 
@@ -96,9 +100,10 @@ func Code(err error) codes.Code {
 		Unwrap() error
 	})
 	if ok {
-		return Code(wrapped.Unwrap())
+		if err := wrapped.Unwrap(); err != nil {
+			return Code(err)
+		}
 	}
-
 	return status.FromContextError(err).Code()
 }
 
@@ -120,7 +125,9 @@ func AsGRPCStatus(err error) (*status.Status, bool) {
 		Unwrap() error
 	})
 	if ok {
-		return AsGRPCStatus(wrapped.Unwrap())
+		if err := wrapped.Unwrap(); err != nil {
+			return AsGRPCStatus(err)
+		}
 	}
 
 	return nil, false
@@ -180,6 +187,10 @@ func FromGRPC(err error) error {
 type withCode struct {
 	code codes.Code
 	error
+}
+
+func (e *withCode) Code() codes.Code {
+	return e.code
 }
 
 func (e *withCode) Unwrap() error {

@@ -11,7 +11,7 @@ ARG ROOTLESSKIT_VERSION=v0.9.5
 ARG CNI_VERSION=v0.8.6
 ARG SHADOW_VERSION=4.8.1
 ARG FUSEOVERLAYFS_VERSION=v1.1.2
-ARG STARGZ_SNAPSHOTTER_VERSION=2ee75e91f8f98f3d324290a2503269812e019fc3
+ARG STARGZ_SNAPSHOTTER_VERSION=3a04e4c2c116c85b4b66d01945cf7ebcb7a2eb5a
 
 # git stage is used for checking out remote repository sources
 FROM --platform=$BUILDPLATFORM alpine AS git
@@ -65,7 +65,7 @@ FROM gobuild-base AS runc
 WORKDIR $GOPATH/src/github.com/opencontainers/runc
 ARG TARGETPLATFORM
 RUN --mount=from=runc-src,src=/usr/src/runc,target=. --mount=target=/root/.cache,type=cache \
-  CGO_ENABLED=1 go build -ldflags '-w -extldflags -static' -tags 'seccomp netgo cgo static_build osusergo' -o /usr/bin/runc ./ && \
+  CGO_ENABLED=1 go build -ldflags '-extldflags -static' -tags 'seccomp netgo cgo static_build osusergo' -o /usr/bin/runc ./ && \
   file /usr/bin/runc | grep "statically linked"
 
 FROM gobuild-base AS buildkit-base
@@ -97,7 +97,7 @@ ARG BUILDKITD_TAGS
 RUN --mount=target=. --mount=target=/root/.cache,type=cache \
   --mount=target=/go/pkg/mod,type=cache \
   --mount=source=/tmp/.ldflags,target=/tmp/.ldflags,from=buildkit-version \
-  go build -ldflags "$(cat /tmp/.ldflags) -w -extldflags -static" -tags "osusergo netgo static_build seccomp ${BUILDKITD_TAGS}" -o /usr/bin/buildkitd ./cmd/buildkitd && \
+  go build -ldflags "$(cat /tmp/.ldflags) -extldflags '-static'" -tags "osusergo netgo static_build seccomp ${BUILDKITD_TAGS}" -o /usr/bin/buildkitd ./cmd/buildkitd && \
   file /usr/bin/buildkitd | egrep "statically linked|Windows"
 
 FROM scratch AS binaries-linux-helper

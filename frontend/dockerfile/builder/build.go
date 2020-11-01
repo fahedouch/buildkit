@@ -14,11 +14,11 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/platforms"
-	"github.com/docker/docker/builder/dockerignore"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/dockerfile/dockerfile2llb"
+	"github.com/moby/buildkit/frontend/dockerfile/dockerignore"
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	gwpb "github.com/moby/buildkit/frontend/gateway/pb"
@@ -54,6 +54,7 @@ const (
 	keyContextSubDir           = "contextsubdir"
 	keyContextKeepGitDir       = "build-arg:BUILDKIT_CONTEXT_KEEP_GIT_DIR"
 	keySyntax                  = "build-arg:BUILDKIT_SYNTAX"
+	keyHostname                = "hostname"
 )
 
 var httpPrefix = regexp.MustCompile(`^https?://`)
@@ -395,6 +396,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 					OverrideCopyImage: opts[keyOverrideCopyImage],
 					LLBCaps:           &caps,
 					SourceMap:         sourceMap,
+					Hostname:          opts[keyHostname],
 				})
 
 				if err != nil {

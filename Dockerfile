@@ -1,16 +1,17 @@
 # syntax = docker/dockerfile:1.1-experimental
 
-ARG RUNC_VERSION=v1.0.0-rc92
+# TODO update RUNC_VERSION with next release after 1.0-rc92
+ARG RUNC_VERSION=939ad4e3fcfa1ab531458355a73688c6f4ee5003
 ARG CONTAINERD_VERSION=v1.4.0
 # containerd v1.3 for integration tests
 ARG CONTAINERD_ALT_VERSION=v1.3.7
 # available targets: buildkitd, buildkitd.oci_only, buildkitd.containerd_only
 ARG BUILDKIT_TARGET=buildkitd
 ARG REGISTRY_VERSION=2.7.1
-ARG ROOTLESSKIT_VERSION=v0.9.5
+ARG ROOTLESSKIT_VERSION=v0.11.0
 ARG CNI_VERSION=v0.8.6
 ARG SHADOW_VERSION=4.8.1
-ARG FUSEOVERLAYFS_VERSION=v1.1.2
+ARG FUSEOVERLAYFS_VERSION=v1.2.0
 ARG STARGZ_SNAPSHOTTER_VERSION=3a04e4c2c116c85b4b66d01945cf7ebcb7a2eb5a
 
 # git stage is used for checking out remote repository sources
@@ -128,6 +129,7 @@ FROM scratch AS release
 COPY --from=releaser /out/ /
 
 FROM tonistiigi/git@sha256:393483e1cef35f09e1a8fe0a0bd93a78b1b6ecec5b5afa5fa5d600fa3ab1fdd8 AS buildkit-export
+RUN apk add --no-cache fuse3 && ln -s fusermount3 /usr/bin/fusermount
 COPY examples/buildctl-daemonless/buildctl-daemonless.sh /usr/bin/
 VOLUME /var/lib/buildkit
 

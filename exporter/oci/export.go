@@ -214,6 +214,10 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 		}
 	}
 
+	response := &controlapi.ExporterResponse{
+		ExporterResponse: nil,
+	}
+
 	report := oneOffProgress(ctx, "sending tarball")
 	if err := archiveexporter.Export(ctx, mprovider, w, expOpts...); err != nil {
 		w.Close()

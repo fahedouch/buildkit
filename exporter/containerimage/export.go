@@ -171,7 +171,6 @@ func (e *imageExporterInstance) Name() string {
 	return "exporting to image"
 }
 
-
 func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source, sessionID string) (*controlapi.ExporterResponse, error) {
 	if src.Metadata == nil {
 		src.Metadata = make(map[string][]byte)

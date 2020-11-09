@@ -176,6 +176,10 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 		return nil, err
 	}
 
+	response := &controlapi.ExporterResponse{
+         ExporterResponse : nil,
+    }
+  
 	mprovider := contentutil.NewMultiProvider(e.opt.ImageWriter.ContentStore())
 	if src.Ref != nil {
 		remote, err := src.Ref.GetRemote(ctx, false, e.layerCompression, session.NewGroup(sessionID))

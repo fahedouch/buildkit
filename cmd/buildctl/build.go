@@ -244,6 +244,14 @@ func buildAction(clicontext *cli.Context) error {
 		}
 	}
 
+	eg.Go(func() error {
+		resp, err := c.Solve(ctx, def, solveOpt, ch)
+		if err != nil {
+			return err
+		}
+		for k, v := range resp.ExportersResponse {
+			logrus.Debugf("exporter response: %d=%s", k, v)
+		}
 	// not using shared context to not disrupt display but let is finish reporting errors
 	pw, err := progresswriter.NewPrinter(context.TODO(), os.Stderr, clicontext.String("progress"))
 	if err != nil {

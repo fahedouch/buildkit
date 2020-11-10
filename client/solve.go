@@ -114,14 +114,6 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 		return nil, err
 	}
 
-	var ex ExportEntry
-	if len(opt.Exports) > 1 {
-		return nil, errors.New("currently only single Exports can be specified")
-	}
-	if len(opt.Exports) == 1 {
-		ex = opt.Exports[0]
-	}
-
 	if !opt.SessionPreInitialized {
 		if len(syncedDirs) > 0 {
 			s.Allow(filesync.NewFSSyncProvider(syncedDirs))
@@ -131,29 +123,50 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			s.Allow(a)
 		}
 
-		switch ex.Type {
-		case ExporterLocal:
-			if ex.Output != nil {
-				return nil, errors.New("output file writer is not supported by local exporter")
-			}
-			if ex.OutputDir == "" {
-				return nil, errors.New("output directory is required for local exporter")
-			}
-			s.Allow(filesync.NewFSSyncTargetDir(ex.OutputDir))
-		case ExporterOCI, ExporterDocker, ExporterTar:
-			if ex.OutputDir != "" {
-				return nil, errors.Errorf("output directory %s is not supported by %s exporter", ex.OutputDir, ex.Type)
-			}
-			if ex.Output == nil {
-				return nil, errors.Errorf("output file writer is required for %s exporter", ex.Type)
-			}
-			s.Allow(filesync.NewFSSyncTarget(ex.Output))
-		default:
-			if ex.Output != nil {
-				return nil, errors.Errorf("output file writer is not supported by %s exporter", ex.Type)
-			}
-			if ex.OutputDir != "" {
-				return nil, errors.Errorf("output directory %s is not supported by %s exporter", ex.OutputDir, ex.Type)
+		duplicateLocalExporter := 0
+		duplicateOciExporter := 0
+		duplicateDockerExporter := 0
+		duplicateTarExporter := 0
+		for _, ex := range opt.Exports {
+			switch ex.Type {
+			case ExporterLocal:
+				duplicateLocalExporter++
+				if duplicateLocalExporter > 1 {
+					return nil, errors.New("using multiple ExporterLocal is not supported")
+				}
+				if ex.Output != nil {
+					return nil, errors.New("output file writer is not supported by local exporter")
+				}
+				if ex.OutputDir == "" {
+					return nil, errors.New("output directory is required for local exporter")
+				}
+				s.Allow(filesync.NewFSSyncTargetDir(ex.OutputDir))
+			case ExporterOCI, ExporterDocker, ExporterTar:
+				switch ex.Type {
+				case ExporterOCI:
+					duplicateOciExporter++
+				case ExporterDocker:
+					duplicateDockerExporter++
+				case ExporterTar:
+					duplicateTarExporter++
+				}
+				if duplicateOciExporter > 1 || duplicateDockerExporter > 1 || duplicateTarExporter > 1 {
+					return nil, errors.New("using multiple ExporterOCI is not supported")
+				}
+				if ex.OutputDir != "" {
+					return nil, errors.Errorf("output directory %s is not supported by %s exporter", ex.OutputDir, ex.Type)
+				}
+				if ex.Output == nil {
+					return nil, errors.Errorf("output file writer is required for %s exporter", ex.Type)
+				}
+				s.Allow(filesync.NewFSSyncTarget(ex.Output))
+			default:
+				if ex.Output != nil {
+					return nil, errors.Errorf("output file writer is not supported by %s exporter", ex.Type)
+				}
+				if ex.OutputDir != "" {
+					return nil, errors.Errorf("output directory %s is not supported by %s exporter", ex.OutputDir, ex.Type)
+				}
 			}
 		}
 
@@ -198,11 +211,40 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			frontendInputs[key] = def.ToPB()
 		}
 
+		var exportersTypes []string
+		var exporterType string
+		m := &controlapi.SolveRequest{
+			ExportersAttrs: []*controlapi.ExporterAttrs{},
+			ExporterAttrs:  &controlapi.ExporterAttrs{},
+		}
+		expo := &controlapi.ExporterAttrs{
+			ExporterAttrs: make(map[string]string),
+		}
+
+		if len(opt.Exports) > 1 {
+			exporterType = ""
+			m.ExporterAttrs = nil
+			for _, ex := range opt.Exports {
+				exportersTypes = append(exportersTypes, ex.Type)
+				expo.ExporterAttrs = ex.Attrs
+				m.ExportersAttrs = append(m.ExportersAttrs, expo)
+			}
+		}
+		if len(opt.Exports) == 1 {
+			exportersTypes = nil
+			m.ExportersAttrs = nil
+			exporterType = opt.Exports[0].Type
+			expo.ExporterAttrs = opt.Exports[0].Attrs
+			m.ExporterAttrs = expo
+		}
+
 		resp, err := c.controlClient().Solve(ctx, &controlapi.SolveRequest{
 			Ref:            ref,
 			Definition:     pbd,
-			Exporter:       ex.Type,
-			ExporterAttrs:  ex.Attrs,
+			Exporters:      exportersTypes,
+			ExportersAttrs: m.ExportersAttrs,
+			Exporter:       exporterType,
+			ExporterAttrs:  m.ExporterAttrs,
 			Session:        s.ID(),
 			Frontend:       opt.Frontend,
 			FrontendAttrs:  opt.FrontendAttrs,
@@ -213,8 +255,13 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 		if err != nil {
 			return errors.Wrap(err, "failed to solve")
 		}
+
+		var exportersResponse []*controlapi.ExporterResponse
+		for _, v := range resp.ExportersResponse {
+			exportersResponse = append(exportersResponse, v)
+		}
 		res = &SolveResponse{
-			ExporterResponse: resp.ExporterResponse,
+			ExportersResponse: exportersResponse,
 		}
 		return nil
 	})
@@ -299,14 +346,18 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 	}
 	// Update index.json of exported cache content store
 	// FIXME(AkihiroSuda): dedupe const definition of cache/remotecache.ExporterResponseManifestDesc = "cache.manifest"
-	if manifestDescJSON := res.ExporterResponse["cache.manifest"]; manifestDescJSON != "" {
-		var manifestDesc ocispec.Descriptor
-		if err = json.Unmarshal([]byte(manifestDescJSON), &manifestDesc); err != nil {
-			return nil, err
-		}
-		for indexJSONPath, tag := range cacheOpt.indicesToUpdate {
-			if err = ociindex.PutDescToIndexJSONFileLocked(indexJSONPath, manifestDesc, tag); err != nil {
-				return nil, err
+	if len(res.ExportersResponse) > 0 {
+		for _, v := range res.ExportersResponse {
+			if manifestDescJSON := v.ExporterResponse["cache.manifest"]; manifestDescJSON != "" {
+				var manifestDesc ocispec.Descriptor
+				if err = json.Unmarshal([]byte(manifestDescJSON), &manifestDesc); err != nil {
+					return nil, err
+				}
+				for indexJSONPath, tag := range cacheOpt.indicesToUpdate {
+					if err = ociindex.PutDescToIndexJSONFileLocked(indexJSONPath, manifestDesc, tag); err != nil {
+						return nil, err
+					}
+				}
 			}
 		}
 	}

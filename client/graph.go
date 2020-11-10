@@ -3,6 +3,7 @@ package client
 import (
 	"time"
 
+	controlapi "github.com/moby/buildkit/api/services/control"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -42,5 +43,5 @@ type SolveStatus struct {
 
 type SolveResponse struct {
 	// ExporterResponse is also used for CacheExporter
-	ExporterResponse map[string]string
+	ExportersResponse []*controlapi.ExporterResponse
 }

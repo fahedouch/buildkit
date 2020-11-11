@@ -215,7 +215,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 		var exporterType string
 		m := &controlapi.SolveRequest{
 			ExportersAttrs: []*controlapi.ExporterAttrs{},
-			ExporterAttrs:  &controlapi.ExporterAttrs{},
+			ExporterAttrs:  make(map[string]string),
 		}
 		expo := &controlapi.ExporterAttrs{
 			ExporterAttrs: make(map[string]string),
@@ -234,8 +234,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			exportersTypes = nil
 			m.ExportersAttrs = nil
 			exporterType = opt.Exports[0].Type
-			expo.ExporterAttrs = opt.Exports[0].Attrs
-			m.ExporterAttrs = expo
+			m.ExporterAttrs = opt.Exports[0].Attrs
 		}
 
 		resp, err := c.controlClient().Solve(ctx, &controlapi.SolveRequest{

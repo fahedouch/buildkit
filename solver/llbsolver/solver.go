@@ -267,7 +267,14 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 		exportersResponse = append(exportersResponse, exporterResponse)
 	}
 
+	if len(exportersResponse) > 1 {
+		exporterResponse = nil
+	} else {
+		exportersResponse = []*controlapi.ExporterResponse{}
+	}
+
 	return &client.SolveResponse{
+		ExporterResponse:  exporterResponse,
 		ExportersResponse: exportersResponse,
 	}, nil
 }

@@ -123,15 +123,17 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			s.Allow(a)
 		}
 
-		duplicateLocalExporter := 0
-		duplicateOciExporter := 0
-		duplicateDockerExporter := 0
-		duplicateTarExporter := 0
+		var mb = map[string]bool{
+			"isLocalExporter":  false,
+			"isOciExporter":    false,
+			"isDockerExporter": false,
+			"isTarExporter":    false,
+		}
+
 		for _, ex := range opt.Exports {
 			switch ex.Type {
 			case ExporterLocal:
-				duplicateLocalExporter++
-				if duplicateLocalExporter > 1 {
+				if mb["isLocalExporter"] == true {
 					return nil, errors.New("using multiple ExporterLocal is not supported")
 				}
 				if ex.Output != nil {
@@ -140,24 +142,25 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 				if ex.OutputDir == "" {
 					return nil, errors.New("output directory is required for local exporter")
 				}
+				mb["isLocalExporter"] = true
 				s.Allow(filesync.NewFSSyncTargetDir(ex.OutputDir))
 			case ExporterOCI, ExporterDocker, ExporterTar:
-				switch ex.Type {
-				case ExporterOCI:
-					duplicateOciExporter++
-				case ExporterDocker:
-					duplicateDockerExporter++
-				case ExporterTar:
-					duplicateTarExporter++
-				}
-				if duplicateOciExporter > 1 || duplicateDockerExporter > 1 || duplicateTarExporter > 1 {
-					return nil, errors.New("using multiple ExporterOCI is not supported")
+				if mb["isOciExporter"] == true || mb["isDockerExporter"] == true || mb["isTarExporter"] == true {
+					return nil, errors.Errorf("using multiple %s is not supported", ex.Type)
 				}
 				if ex.OutputDir != "" {
 					return nil, errors.Errorf("output directory %s is not supported by %s exporter", ex.OutputDir, ex.Type)
 				}
 				if ex.Output == nil {
 					return nil, errors.Errorf("output file writer is required for %s exporter", ex.Type)
+				}
+				switch ex.Type {
+				case ExporterOCI:
+					mb["isOciExporter"] = true
+				case ExporterDocker:
+					mb["isDockerExporter"] = true
+				case ExporterTar:
+					mb["isTarExporter"] = true
 				}
 				s.Allow(filesync.NewFSSyncTarget(ex.Output))
 			default:
@@ -211,54 +214,53 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			frontendInputs[key] = def.ToPB()
 		}
 
-		var exportersTypes []string
 		var exporterType string
+
 		m := &controlapi.SolveRequest{
-			ExportersAttrs: []*controlapi.ExporterAttrs{},
-			ExporterAttrs:  make(map[string]string),
-		}
-		expo := &controlapi.ExporterAttrs{
-			ExporterAttrs: make(map[string]string),
+			Exporters: []*controlapi.Exporter{},
 		}
 
-		if len(opt.Exports) > 1 {
-			exporterType = ""
-			m.ExporterAttrs = nil
-			for _, ex := range opt.Exports {
-				exportersTypes = append(exportersTypes, ex.Type)
-				expo.ExporterAttrs = ex.Attrs
-				m.ExportersAttrs = append(m.ExportersAttrs, expo)
+		for _, ex := range opt.Exports {
+			Exporter := &controlapi.Exporter{
+				Name:          ex.Type,
+				ExporterAttrs: ex.Attrs,
 			}
+			m.Exporters = append(m.Exporters, Exporter)
 		}
+
 		if len(opt.Exports) == 1 {
-			exportersTypes = nil
-			m.ExportersAttrs = nil
 			exporterType = opt.Exports[0].Type
-			m.ExporterAttrs = opt.Exports[0].Attrs
+			m.ExporterAttrsDeprecated = opt.Exports[0].Attrs
+			m.Exporters = nil
 		}
 
 		resp, err := c.controlClient().Solve(ctx, &controlapi.SolveRequest{
-			Ref:            ref,
-			Definition:     pbd,
-			Exporters:      exportersTypes,
-			ExportersAttrs: m.ExportersAttrs,
-			Exporter:       exporterType,
-			ExporterAttrs:  m.ExporterAttrs,
-			Session:        s.ID(),
-			Frontend:       opt.Frontend,
-			FrontendAttrs:  opt.FrontendAttrs,
-			FrontendInputs: frontendInputs,
-			Cache:          cacheOpt.options,
-			Entitlements:   opt.AllowedEntitlements,
+			Ref:                     ref,
+			Definition:              pbd,
+			Exporters:               m.Exporters,
+			ExporterDeprecated:      exporterType,
+			ExporterAttrsDeprecated: m.ExporterAttrsDeprecated,
+			Session:                 s.ID(),
+			Frontend:                opt.Frontend,
+			FrontendAttrs:           opt.FrontendAttrs,
+			FrontendInputs:          frontendInputs,
+			Cache:                   cacheOpt.options,
+			Entitlements:            opt.AllowedEntitlements,
 		})
 		if err != nil {
 			return errors.Wrap(err, "failed to solve")
 		}
 
 		var exportersResponse []*controlapi.ExporterResponse
-		for _, v := range resp.ExportersResponse {
-			exportersResponse = append(exportersResponse, v)
+
+		if len(resp.ExportersResponse) == 0 {
+			exportersResponse = append(exportersResponse, resp.ExporterResponse)
+		} else {
+			for _, v := range resp.ExportersResponse {
+				exportersResponse = append(exportersResponse, v)
+			}
 		}
+
 		res = &SolveResponse{
 			ExportersResponse: exportersResponse,
 		}
@@ -345,17 +347,15 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 	}
 	// Update index.json of exported cache content store
 	// FIXME(AkihiroSuda): dedupe const definition of cache/remotecache.ExporterResponseManifestDesc = "cache.manifest"
-	if len(res.ExportersResponse) > 0 {
-		for _, v := range res.ExportersResponse {
-			if manifestDescJSON := v.ExporterResponse["cache.manifest"]; manifestDescJSON != "" {
-				var manifestDesc ocispec.Descriptor
-				if err = json.Unmarshal([]byte(manifestDescJSON), &manifestDesc); err != nil {
+	for _, v := range res.ExportersResponse {
+		if manifestDescJSON := v.ExporterResponse["cache.manifest"]; manifestDescJSON != "" {
+			var manifestDesc ocispec.Descriptor
+			if err = json.Unmarshal([]byte(manifestDescJSON), &manifestDesc); err != nil {
+				return nil, err
+			}
+			for indexJSONPath, tag := range cacheOpt.indicesToUpdate {
+				if err = ociindex.PutDescToIndexJSONFileLocked(indexJSONPath, manifestDesc, tag); err != nil {
 					return nil, err
-				}
-				for indexJSONPath, tag := range cacheOpt.indicesToUpdate {
-					if err = ociindex.PutDescToIndexJSONFileLocked(indexJSONPath, manifestDesc, tag); err != nil {
-						return nil, err
-					}
 				}
 			}
 		}

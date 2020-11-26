@@ -42,6 +42,6 @@ type SolveStatus struct {
 }
 
 type SolveResponse struct {
-	// ExporterResponse is also used for CacheExporter
+	ExporterResponse  *controlapi.ExporterResponse
 	ExportersResponse []*controlapi.ExporterResponse
 }

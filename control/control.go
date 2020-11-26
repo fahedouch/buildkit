@@ -234,23 +234,23 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		return nil, err
 	}
 
-	if req.Exporter != "" {
-		exp, err := w.Exporter(req.Exporter, c.opt.SessionManager)
+	if req.ExporterDeprecated != "" {
+		exp, err := w.Exporter(req.ExporterDeprecated, c.opt.SessionManager)
 		if err != nil {
 			return nil, err
 		}
-		expi, err = exp.Resolve(ctx, req.ExporterAttrs)
+		expi, err = exp.Resolve(ctx, req.ExporterAttrsDeprecated)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if req.Exporters != nil {
 		for i := 0; i <= len(req.Exporters)-1; i++ {
-			exp, err := w.Exporter(req.Exporters[i], c.opt.SessionManager)
+			exp, err := w.Exporter(req.Exporters[i].Name, c.opt.SessionManager)
 			if err != nil {
 				return nil, err
 			}
-			expi, err = exp.Resolve(ctx, req.ExportersAttrs[i].ExporterAttrs)
+			expi, err = exp.Resolve(ctx, req.Exporters[i].ExporterAttrs)
 			if err != nil {
 				return nil, err
 			}
@@ -304,6 +304,7 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		return nil, err
 	}
 	return &controlapi.SolveResponse{
+		ExporterResponse:  resp.ExporterResponse,
 		ExportersResponse: resp.ExportersResponse,
 	}, nil
 }

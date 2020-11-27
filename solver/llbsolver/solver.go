@@ -152,8 +152,9 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 		return nil, err
 	}
 
-	var exporterResponse *controlapi.ExporterResponse
-	var exportersResponse []*controlapi.ExporterResponse
+	exporterResponse := &controlapi.ExporterResponse{}
+	exportersResponse := []*controlapi.ExporterResponse{}
+
 	if a := exp.Exporter; a != nil {
 		exp.Exporters = append(exp.Exporters, a)
 	}

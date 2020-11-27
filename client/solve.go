@@ -251,7 +251,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			return errors.Wrap(err, "failed to solve")
 		}
 
-		var exportersResponse []*controlapi.ExporterResponse
+		exportersResponse := []*controlapi.ExporterResponse{}
 
 		if len(resp.ExportersResponse) == 0 {
 			exportersResponse = append(exportersResponse, resp.ExporterResponse)

@@ -268,7 +268,7 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 	}
 
 	if len(exportersResponse) > 1 {
-		exporterResponse = nil
+		exporterResponse = &controlapi.ExporterResponse{}
 	} else {
 		exportersResponse = []*controlapi.ExporterResponse{}
 	}

@@ -118,6 +118,7 @@ func TestIntegration(t *testing.T) {
 		testTarExporterWithSocketCopy,
 		testTarExporterSymlink,
 		testMultipleRegistryCacheImportExport,
+		testMultipleExporters,
 		testSourceMap,
 		testSourceMapFromRef,
 		testLazyImagePush,
@@ -1414,6 +1415,61 @@ func testUser(t *testing.T, sb integration.Sandbox) {
 	require.Contains(t, string(dt), "1")
 
 	checkAllReleasable(t, c, sb, true)
+}
+
+func testMultipleExporters(t *testing.T, sb integration.Sandbox) {
+	c, err := New(context.TODO(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	def, err := llb.Image("busybox").Marshal(context.TODO())
+	require.NoError(t, err)
+
+	destDir1, err := ioutil.TempDir("", "buildkit1")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir1)
+
+	destDir2, err := ioutil.TempDir("", "buildkit2")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir2)
+
+	_, err = c.Solve(context.TODO(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir1,
+			},
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir2,
+			},
+		},
+	}, nil)
+	require.Error(t, err)
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrorRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	target := registry + "/buildkit/build/exporter:image"
+
+	_, err = c.Solve(context.TODO(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir1,
+			},
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": target,
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
 }
 
 func testOCIExporter(t *testing.T, sb integration.Sandbox) {

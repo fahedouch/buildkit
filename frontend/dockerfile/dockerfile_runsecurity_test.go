@@ -1,26 +1,24 @@
-// +build dfrunsecurity
-
 package dockerfile
 
 import (
-	"context"
-	"os"
 	"testing"
 
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/frontend/dockerfile/builder"
+	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/stretchr/testify/require"
+	"github.com/tonistiigi/fsutil"
 )
 
-var runSecurityTests = []integration.Test{
+// Tests that depend on the `security.*` entitlements
+var securityTests = integration.TestFuncs(
 	testRunSecurityInsecure,
 	testRunSecuritySandbox,
 	testRunSecurityDefault,
 	testInsecureDevicesWhitelist,
-}
+)
 
 func init() {
 	securityOpts = []integration.TestOpt{
@@ -29,9 +27,6 @@ func init() {
 			"tonistiigi/hellofs:latest": "docker.io/tonistiigi/hellofs:latest",
 		}),
 	}
-
-	securityTests = append(securityTests, runSecurityTests...)
-
 }
 
 func testInsecureDevicesWhitelist(t *testing.T, sb integration.Sandbox) {
@@ -59,22 +54,21 @@ RUN --security=insecure ls -l /dev && dd if=/dev/zero of=disk.img bs=20M count=1
 	rm disk.img
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
-		AllowedEntitlements: []entitlements.Entitlement{entitlements.EntitlementSecurityInsecure},
+		AllowedEntitlements: []string{entitlements.EntitlementSecurityInsecure.String()},
 	}, nil)
 
 	secMode := sb.Value("security.insecure")
@@ -94,26 +88,25 @@ func testRunSecurityInsecure(t *testing.T, sb integration.Sandbox) {
 
 	dockerfile := []byte(`
 FROM busybox
-RUN --security=insecure [ "$(cat /proc/self/status | grep CapBnd)" == "CapBnd:	0000003fffffffff" ]
+RUN --security=insecure [ "$(printf '%x' $(( $(cat /proc/self/status | grep CapBnd | cut -f 2 | sed s#^#0x#) & 0x3fffffffff)))" == "3fffffffff" ]
 RUN [ "$(cat /proc/self/status | grep CapBnd)" == "CapBnd:	00000000a80425fb" ]
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
-		AllowedEntitlements: []entitlements.Entitlement{entitlements.EntitlementSecurityInsecure},
+		AllowedEntitlements: []string{entitlements.EntitlementSecurityInsecure.String()},
 	}, nil)
 
 	secMode := sb.Value("security.insecure")
@@ -136,20 +129,19 @@ FROM busybox
 RUN --security=sandbox [ "$(cat /proc/self/status | grep CapBnd)" == "CapBnd:	00000000a80425fb" ]
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 
@@ -164,22 +156,21 @@ FROM busybox
 RUN [ "$(cat /proc/self/status | grep CapBnd)" == "CapBnd:	00000000a80425fb" ]
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
-		AllowedEntitlements: []entitlements.Entitlement{entitlements.EntitlementSecurityInsecure},
+		AllowedEntitlements: []string{entitlements.EntitlementSecurityInsecure.String()},
 	}, nil)
 
 	secMode := sb.Value("security.insecure")

@@ -11,23 +11,23 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v3"
 )
 
-var DumpLLBCommand = cli.Command{
+var DumpLLBCommand = &cli.Command{
 	Name:      "dump-llb",
 	Usage:     "dump LLB in human-readable format. LLB can be also passed via stdin. This command does not require the daemon to be running.",
 	ArgsUsage: "<llbfile>",
-	Action:    dumpLLB,
+	Action:    commandAction(dumpLLB),
 	Flags: []cli.Flag{
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "dot",
 			Usage: "Output dot format",
 		},
 	},
 }
 
-func dumpLLB(clicontext *cli.Context) error {
+func dumpLLB(clicontext *cli.Command) error {
 	var r io.Reader
 	if llbFile := clicontext.Args().First(); llbFile != "" && llbFile != "-" {
 		f, err := os.Open(llbFile)
@@ -57,9 +57,9 @@ func dumpLLB(clicontext *cli.Context) error {
 }
 
 type llbOp struct {
-	Op         pb.Op
+	Op         *pb.Op
 	Digest     digest.Digest
-	OpMetadata pb.OpMetadata
+	OpMetadata *pb.OpMetadata
 }
 
 func loadLLB(r io.Reader) ([]llbOp, error) {
@@ -70,11 +70,11 @@ func loadLLB(r io.Reader) ([]llbOp, error) {
 	var ops []llbOp
 	for _, dt := range def.Def {
 		var op pb.Op
-		if err := (&op).Unmarshal(dt); err != nil {
+		if err := op.UnmarshalVT(dt); err != nil {
 			return nil, errors.Wrap(err, "failed to parse op")
 		}
 		dgst := digest.FromBytes(dt)
-		ent := llbOp{Op: op, Digest: dgst, OpMetadata: def.Metadata[dgst]}
+		ent := llbOp{Op: &op, Digest: dgst, OpMetadata: def.Metadata[dgst].ToPB()}
 		ops = append(ops, ent)
 	}
 	return ops, nil
@@ -103,7 +103,7 @@ func writeDot(ops []llbOp, w io.Writer) {
 	}
 }
 
-func attr(dgst digest.Digest, op pb.Op) (string, string) {
+func attr(dgst digest.Digest, op *pb.Op) (string, string) {
 	switch op := op.Op.(type) {
 	case *pb.Op_Source:
 		return op.Source.Identifier, "ellipse"
@@ -111,6 +111,10 @@ func attr(dgst digest.Digest, op pb.Op) (string, string) {
 		return strings.Join(op.Exec.Meta.Args, " "), "box"
 	case *pb.Op_Build:
 		return "build", "box3d"
+	case *pb.Op_Merge:
+		return "merge", "invtriangle"
+	case *pb.Op_Diff:
+		return "diff", "doublecircle"
 	case *pb.Op_File:
 		names := []string{}
 
@@ -126,6 +130,8 @@ func attr(dgst digest.Digest, op pb.Op) (string, string) {
 				name = fmt.Sprintf("mkdir{path=%s}", act.Mkdir.Path)
 			case *pb.FileAction_Rm:
 				name = fmt.Sprintf("rm{path=%s}", act.Rm.Path)
+			case *pb.FileAction_Symlink:
+				name = fmt.Sprintf("symlink{oldpath=%s, newpath=%s}", act.Symlink.Oldpath, act.Symlink.Newpath)
 			}
 
 			names = append(names, name)

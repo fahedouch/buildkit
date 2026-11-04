@@ -1,33 +1,27 @@
 package content
 
 import (
-	"context"
-	"io/ioutil"
-	"os"
 	"testing"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/local"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/testutil"
 	digest "github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
 
 func TestContentAttachable(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	t.Parallel()
 	ids := []string{"store-id-0", "store-id-1"}
 	attachableStores := make(map[string]content.Store)
 	testBlobs := make(map[string]map[digest.Digest][]byte)
 	for _, id := range ids {
-		tmpDir, err := ioutil.TempDir("", "contenttest")
-		require.NoError(t, err)
-		defer os.RemoveAll(tmpDir)
-		store, err := local.NewStore(tmpDir)
+		store, err := local.NewStore(t.TempDir())
 		require.NoError(t, err)
 		blob := []byte("test-content-attachable-" + id)
 		w, err := store.Writer(ctx, content.WithRef(string(blob)))
@@ -45,7 +39,7 @@ func TestContentAttachable(t *testing.T) {
 		}
 	}
 
-	s, err := session.NewSession(ctx, "foo", "bar")
+	s, err := session.NewSession(ctx, "bar")
 	require.NoError(t, err)
 
 	m, err := session.NewManager()
@@ -70,7 +64,7 @@ func TestContentAttachable(t *testing.T) {
 		for storeID, blobMap := range testBlobs {
 			callerStore := NewCallerStore(c, storeID)
 			for dgst, blob := range blobMap {
-				blob2, err := content.ReadBlob(ctx, callerStore, ocispec.Descriptor{Digest: dgst})
+				blob2, err := content.ReadBlob(ctx, callerStore, ocispecs.Descriptor{Digest: dgst})
 				if err != nil {
 					return err
 				}

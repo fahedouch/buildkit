@@ -17,16 +17,132 @@
 package fs
 
 import (
-	"io"
+	"errors"
+	"fmt"
 	"os"
 	"syscall"
 
 	"github.com/containerd/continuity/sysx"
-	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
 )
 
-func copyFileInfo(fi os.FileInfo, name string) error {
+// maxCopyChunk is the maximum size passed to copy_file_range per call,
+// avoiding int overflow on 32-bit architectures.
+const maxCopyChunk = 1 << 30 // 1 GiB
+
+// copyFile copies a file from source to target preserving sparse file holes.
+//
+// If the filesystem does not support SEEK_DATA/SEEK_HOLE, it falls back
+// to a plain io.Copy.
+func copyFile(target, source string) error {
+	src, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("failed to open source %s: %w", source, err)
+	}
+	defer src.Close()
+
+	fi, err := src.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat source %s: %w", source, err)
+	}
+	size := fi.Size()
+
+	tgt, err := os.Create(target)
+	if err != nil {
+		return fmt.Errorf("failed to open target %s: %w", target, err)
+	}
+	defer tgt.Close()
+
+	if err := tgt.Truncate(size); err != nil {
+		return fmt.Errorf("failed to truncate target %s: %w", target, err)
+	}
+
+	srcFd := int(src.Fd())
+
+	// Try a SEEK_DATA to check if the filesystem supports it.
+	// If not, fall back to a plain copy.
+	if _, err := unix.Seek(srcFd, 0, unix.SEEK_DATA); err != nil {
+		// ENXIO means no data in the file at all. In other words it's entirely sparse.
+		// The truncated target is already correct.
+		if errors.Is(err, syscall.ENXIO) {
+			return nil
+		}
+
+		if errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EINVAL) {
+			// Filesystem doesn't support SEEK_DATA/SEEK_HOLE. Fall back to a plain copy.
+			src.Close()
+			tgt.Close()
+			return openAndCopyFile(target, source)
+		}
+
+		return fmt.Errorf("failed to seek data in source %s: %w", source, err)
+	}
+
+	// Copy data regions from source to target, skipping holes.
+	var offset int64
+	tgtFd := int(tgt.Fd())
+
+	for offset < size {
+		dataStart, err := unix.Seek(srcFd, offset, unix.SEEK_DATA)
+		if err != nil {
+			// No more data past offset. Remainder of file is a hole.
+			if errors.Is(err, syscall.ENXIO) {
+				break
+			}
+			return fmt.Errorf("SEEK_DATA failed at offset %d: %w", offset, err)
+		}
+
+		// Find the end of this data region (start of next hole).
+		holeStart, err := unix.Seek(srcFd, dataStart, unix.SEEK_HOLE)
+		if err != nil {
+			// ENXIO shouldn't happen after a successful SEEK_DATA, but
+			// treat it as data extending to end of file.
+			if errors.Is(err, syscall.ENXIO) {
+				holeStart = size
+			} else {
+				return fmt.Errorf("SEEK_HOLE failed at offset %d: %w", dataStart, err)
+			}
+		}
+
+		// Copy the data region [dataStart, holeStart).
+		srcOff := dataStart
+		tgtOff := dataStart
+		remain := holeStart - dataStart
+
+		for remain > 0 {
+			chunk := remain
+			if chunk > maxCopyChunk {
+				chunk = maxCopyChunk
+			}
+
+			n, err := unix.CopyFileRange(srcFd, &srcOff, tgtFd, &tgtOff, int(chunk), 0)
+			if err != nil {
+				// Fall back to a plain copy if copy_file_range is not supported
+				// across the source and target filesystems.
+				if errors.Is(err, syscall.EXDEV) || errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EOPNOTSUPP) {
+					src.Close()
+					tgt.Close()
+					return openAndCopyFile(target, source)
+				}
+				return fmt.Errorf("copy_file_range failed: %w", err)
+			}
+			if n == 0 {
+				return fmt.Errorf("copy_file_range returned 0 with %d bytes remaining", remain)
+			}
+			remain -= int64(n)
+		}
+
+		offset = holeStart
+	}
+
+	if err := tgt.Sync(); err != nil {
+		return fmt.Errorf("failed to sync target %s: %w", target, err)
+	}
+
+	return nil
+}
+
+func copyFileInfo(fi os.FileInfo, src, name string) error {
 	st := fi.Sys().(*syscall.Stat_t)
 	if err := os.Lchown(name, int(st.Uid), int(st.Gid)); err != nil {
 		if os.IsPermission(err) {
@@ -41,13 +157,13 @@ func copyFileInfo(fi os.FileInfo, name string) error {
 			}
 		}
 		if err != nil {
-			return errors.Wrapf(err, "failed to chown %s", name)
+			return fmt.Errorf("failed to chown %s: %w", name, err)
 		}
 	}
 
 	if (fi.Mode() & os.ModeSymlink) != os.ModeSymlink {
 		if err := os.Chmod(name, fi.Mode()); err != nil {
-			return errors.Wrapf(err, "failed to chmod %s", name)
+			return fmt.Errorf("failed to chmod %s: %w", name, err)
 		}
 	}
 
@@ -56,78 +172,42 @@ func copyFileInfo(fi os.FileInfo, name string) error {
 		unix.NsecToTimespec(syscall.TimespecToNsec(StatMtime(st))),
 	}
 	if err := unix.UtimesNanoAt(unix.AT_FDCWD, name, timespec, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return errors.Wrapf(err, "failed to utime %s", name)
+		return fmt.Errorf("failed to utime %s: %w", name, err)
 	}
 
 	return nil
 }
 
-const maxSSizeT = int64(^uint(0) >> 1)
-
-func copyFileContent(dst, src *os.File) error {
-	st, err := src.Stat()
-	if err != nil {
-		return errors.Wrap(err, "unable to stat source")
-	}
-
-	size := st.Size()
-	first := true
-	srcFd := int(src.Fd())
-	dstFd := int(dst.Fd())
-
-	for size > 0 {
-		// Ensure that we are never trying to copy more than SSIZE_MAX at a
-		// time and at the same time avoids overflows when the file is larger
-		// than 4GB on 32-bit systems.
-		var copySize int
-		if size > maxSSizeT {
-			copySize = int(maxSSizeT)
-		} else {
-			copySize = int(size)
-		}
-		n, err := unix.CopyFileRange(srcFd, nil, dstFd, nil, copySize, 0)
-		if err != nil {
-			if (err != unix.ENOSYS && err != unix.EXDEV) || !first {
-				return errors.Wrap(err, "copy file range failed")
-			}
-
-			buf := bufferPool.Get().(*[]byte)
-			_, err = io.CopyBuffer(dst, src, *buf)
-			bufferPool.Put(buf)
-			return errors.Wrap(err, "userspace copy failed")
-		}
-
-		first = false
-		size -= int64(n)
-	}
-
-	return nil
-}
-
-func copyXAttrs(dst, src string, xeh XAttrErrorHandler) error {
+func copyXAttrs(dst, src string, excludes map[string]struct{}, errorHandler XAttrErrorHandler) error {
 	xattrKeys, err := sysx.LListxattr(src)
 	if err != nil {
-		e := errors.Wrapf(err, "failed to list xattrs on %s", src)
-		if xeh != nil {
-			e = xeh(dst, src, "", e)
+		if errors.Is(err, unix.ENOTSUP) {
+			return nil
+		}
+		e := fmt.Errorf("failed to list xattrs on %s: %w", src, err)
+		if errorHandler != nil {
+			e = errorHandler(dst, src, "", e)
 		}
 		return e
 	}
 	for _, xattr := range xattrKeys {
+		if _, exclude := excludes[xattr]; exclude {
+			continue
+		}
 		data, err := sysx.LGetxattr(src, xattr)
 		if err != nil {
-			e := errors.Wrapf(err, "failed to get xattr %q on %s", xattr, src)
-			if xeh != nil {
-				if e = xeh(dst, src, xattr, e); e == nil {
+			e := fmt.Errorf("failed to get xattr %q on %s: %w", xattr, src, err)
+			if errorHandler != nil {
+				if e = errorHandler(dst, src, xattr, e); e == nil {
 					continue
 				}
 			}
 			return e
 		}
 		if err := sysx.LSetxattr(dst, xattr, data, 0); err != nil {
-			e := errors.Wrapf(err, "failed to set xattr %q on %s", xattr, dst)
-			if xeh != nil {
-				if e = xeh(dst, src, xattr, e); e == nil {
+			e := fmt.Errorf("failed to set xattr %q on %s: %w", xattr, dst, err)
+			if errorHandler != nil {
+				if e = errorHandler(dst, src, xattr, e); e == nil {
 					continue
 				}
 			}
@@ -136,12 +216,4 @@ func copyXAttrs(dst, src string, xeh XAttrErrorHandler) error {
 	}
 
 	return nil
-}
-
-func copyDevice(dst string, fi os.FileInfo) error {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return errors.New("unsupported stat type")
-	}
-	return unix.Mknod(dst, uint32(fi.Mode()), int(st.Rdev))
 }

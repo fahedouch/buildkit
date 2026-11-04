@@ -3,38 +3,40 @@ package dockerfile2llb
 import (
 	"testing"
 
-	"github.com/containerd/containerd/platforms"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/containerd/platforms"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestResolveBuildPlatforms(t *testing.T) {
-	dummyPlatform1 := specs.Platform{Architecture: "DummyArchitecture1", OS: "DummyOS1"}
-	dummyPlatform2 := specs.Platform{Architecture: "DummyArchitecture2", OS: "DummyOS2"}
+	dummyPlatform1 := ocispecs.Platform{Architecture: "DummyArchitecture1", OS: "DummyOS1"}
+	dummyPlatform2 := ocispecs.Platform{Architecture: "DummyArchitecture2", OS: "DummyOS2"}
 
 	// BuildPlatforms is set and TargetPlatform is set
-	opt := ConvertOpt{TargetPlatform: &dummyPlatform1, BuildPlatforms: []specs.Platform{dummyPlatform2}}
+	opt := ConvertOpt{TargetPlatform: &dummyPlatform1}
+	opt.BuildPlatforms = []ocispecs.Platform{dummyPlatform2}
 	result := buildPlatformOpt(&opt).buildPlatforms
-	assert.Equal(t, []specs.Platform{dummyPlatform2}, result)
+	assert.Equal(t, []ocispecs.Platform{dummyPlatform2}, result)
 
 	// BuildPlatforms is not set and TargetPlatform is set
-	opt = ConvertOpt{TargetPlatform: &dummyPlatform1, BuildPlatforms: nil}
+	opt = ConvertOpt{TargetPlatform: &dummyPlatform1}
 	result = buildPlatformOpt(&opt).buildPlatforms
-	assert.Equal(t, []specs.Platform{dummyPlatform1}, result)
+	assert.Equal(t, []ocispecs.Platform{dummyPlatform1}, result)
 
 	// BuildPlatforms is set and TargetPlatform is not set
-	opt = ConvertOpt{TargetPlatform: nil, BuildPlatforms: []specs.Platform{dummyPlatform2}}
+	opt = ConvertOpt{TargetPlatform: nil}
+	opt.BuildPlatforms = []ocispecs.Platform{dummyPlatform2}
 	result = buildPlatformOpt(&opt).buildPlatforms
-	assert.Equal(t, []specs.Platform{dummyPlatform2}, result)
+	assert.Equal(t, []ocispecs.Platform{dummyPlatform2}, result)
 
 	// BuildPlatforms is not set and TargetPlatform is not set
-	opt = ConvertOpt{TargetPlatform: nil, BuildPlatforms: nil}
+	opt = ConvertOpt{}
 	result = buildPlatformOpt(&opt).buildPlatforms
-	assert.Equal(t, []specs.Platform{platforms.DefaultSpec()}, result)
+	assert.Equal(t, []ocispecs.Platform{platforms.DefaultSpec()}, result)
 }
 
 func TestResolveTargetPlatform(t *testing.T) {
-	dummyPlatform := specs.Platform{Architecture: "DummyArchitecture", OS: "DummyOS"}
+	dummyPlatform := ocispecs.Platform{Architecture: "DummyArchitecture", OS: "DummyOS"}
 
 	// TargetPlatform is set
 	opt := ConvertOpt{TargetPlatform: &dummyPlatform}
@@ -48,7 +50,7 @@ func TestResolveTargetPlatform(t *testing.T) {
 }
 
 func TestImplicitTargetPlatform(t *testing.T) {
-	dummyPlatform := specs.Platform{Architecture: "DummyArchitecture", OS: "DummyOS"}
+	dummyPlatform := ocispecs.Platform{Architecture: "DummyArchitecture", OS: "DummyOS"}
 
 	// TargetPlatform is set
 	opt := ConvertOpt{TargetPlatform: &dummyPlatform}

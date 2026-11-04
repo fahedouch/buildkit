@@ -1,60 +1,89 @@
-// +build linux,!no_containerd_worker
+//go:build !windows
 
 package containerd
 
 import (
-	"io/ioutil"
-	"os"
 	"testing"
 
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/util/testutil/integration"
+	"github.com/moby/buildkit/util/testutil/workers"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/tests"
 	"github.com/stretchr/testify/require"
 )
 
+func TestMain(m *testing.M) {
+	defer tests.RunMirror()()
+	m.Run()
+}
+
 func init() {
-	integration.InitContainerdWorker()
+	workers.InitContainerdWorker()
 }
 
 func TestContainerdWorkerIntegration(t *testing.T) {
 	checkRequirement(t)
-	integration.Run(t, []integration.Test{
+	integration.Run(t, integration.TestFuncs(
 		testContainerdWorkerExec,
 		testContainerdWorkerExecFailures,
-	})
+		testContainerdWorkerCancel,
+	))
 }
 
-func newWorkerOpt(t *testing.T, addr string) (base.WorkerOpt, func()) {
-	tmpdir, err := ioutil.TempDir("", "workertest")
-	require.NoError(t, err)
-	cleanup := func() { os.RemoveAll(tmpdir) }
-	workerOpt, err := NewWorkerOpt(tmpdir, addr, "overlayfs", "buildkit-test", nil, nil, netproviders.Opt{Mode: "host"}, "")
-	require.NoError(t, err)
-	return workerOpt, cleanup
-}
-
-func checkRequirement(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("requires root")
+func newWorkerOpt(t *testing.T, addr string) base.WorkerOpt {
+	tmpdir := t.TempDir()
+	rootless := false
+	options := WorkerOptions{
+		Root:            tmpdir,
+		Address:         addr,
+		SnapshotterName: "overlayfs",
+		Namespace:       "buildkit-test",
+		CgroupParent:    "",
+		Rootless:        rootless,
+		Labels:          nil,
+		DNS:             nil,
+		NetworkOpt:      netproviders.Opt{Mode: "host"},
+		ApparmorProfile: "",
+		Selinux:         false,
+		ParallelismSem:  nil,
+		TraceSocket:     "",
+		Runtime:         nil,
 	}
+	workerOpt, err := NewWorkerOpt(options)
+	require.NoError(t, err)
+	return workerOpt
 }
 
 func testContainerdWorkerExec(t *testing.T, sb integration.Sandbox) {
-	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, sb.ContainerdAddress())
-	defer cleanupWorkerOpt()
-	w, err := base.NewWorker(workerOpt)
+	if sb.Rootless() {
+		t.Skip("requires root")
+	}
+	workerOpt := newWorkerOpt(t, sb.ContainerdAddress())
+	w, err := base.NewWorker(t.Context(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerExec(t, w)
 }
 
 func testContainerdWorkerExecFailures(t *testing.T, sb integration.Sandbox) {
-	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, sb.ContainerdAddress())
-	defer cleanupWorkerOpt()
-	w, err := base.NewWorker(workerOpt)
+	if sb.Rootless() {
+		t.Skip("requires root")
+	}
+	workerOpt := newWorkerOpt(t, sb.ContainerdAddress())
+	w, err := base.NewWorker(t.Context(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerExecFailures(t, w)
+}
+
+func testContainerdWorkerCancel(t *testing.T, sb integration.Sandbox) {
+	if sb.Rootless() {
+		t.Skip("requires root")
+	}
+	workerOpt := newWorkerOpt(t, sb.ContainerdAddress())
+	w, err := base.NewWorker(t.Context(), workerOpt)
+	require.NoError(t, err)
+
+	tests.TestWorkerCancel(t, w)
 }

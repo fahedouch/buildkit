@@ -14,8 +14,8 @@ import (
 // package from Go, but it does implement the context.Context
 // interface.
 //
-// When a FUSE request is canceled, the API routine should respond by
-// returning the EINTR status code.
+// When a FUSE request is canceled, and the file system chooses to honor
+// the cancellation, the response should be EINTR.
 type Context struct {
 	Caller
 	Cancel <-chan struct{}
@@ -51,7 +51,7 @@ func NewContext(ctx context.Context, caller *Caller) context.Context {
 	return context.WithValue(ctx, callerKey, caller)
 }
 
-func (c *Context) Value(key interface{}) interface{} {
+func (c *Context) Value(key any) any {
 	if key == callerKey {
 		return &c.Caller
 	}

@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    open-pull-requests-limit: 10
+    directory: "/"
+    schedule:
+      interval: "daily"
+    groups:
+      crazy-max-dot-github:
+        patterns:
+          - "crazy-max/.github/*"
+    cooldown:
+      default-days: 2
+    labels:
+      - "area/dependencies"
+      - "bot"

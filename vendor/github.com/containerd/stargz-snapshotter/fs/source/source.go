@@ -21,28 +21,31 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/labels"
-	"github.com/containerd/containerd/reference"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/containerd/v2/pkg/reference"
 	"github.com/containerd/stargz-snapshotter/fs/config"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-// GetSource is a function for converting snapshot labels into typed blob sources
+// GetSources is a function for converting snapshot labels into typed blob sources
 // information. This package defines a default converter which provides source
 // information based on some labels but implementations aren't required to use labels.
 // Implementations are allowed to return several sources (registry config + image refs)
 // about the blob.
 type GetSources func(labels map[string]string) (source []Source, err error)
 
+// RegistryHosts returns a list of registries that provides the specified image.
+type RegistryHosts func(reference.Spec) ([]docker.RegistryHost, error)
+
 // Source is a typed blob source information. This contains information about
 // a blob stored in registries and some contexts of the blob.
 type Source struct {
 
 	// Hosts is a registry configuration where this blob is stored.
-	Hosts docker.RegistryHosts
+	Hosts RegistryHosts
 
 	// Name is an image reference which contains this blob.
 	Name reference.Spec
@@ -67,11 +70,19 @@ const (
 	// targetImageLayersLabel is a label which contains layer digests contained in
 	// the target image.
 	targetImageLayersLabel = "containerd.io/snapshot/remote/stargz.layers"
+
+	// targetImageURLsLabelPrefix is a label prefix which constructs a map from the layer index to
+	// urls of the layer descriptor.
+	targetImageURLsLabelPrefix = "containerd.io/snapshot/remote/urls."
+
+	// targetURsLLabel is a label which contains layer URL. This is only used to pass URL from containerd
+	// to snapshotter.
+	targetURLsLabel = "containerd.io/snapshot/remote/urls"
 )
 
 // FromDefaultLabels returns a function for converting snapshot labels to
 // source information based on labels.
-func FromDefaultLabels(hosts docker.RegistryHosts) GetSources {
+func FromDefaultLabels(hosts RegistryHosts) GetSources {
 	return func(labels map[string]string) ([]Source, error) {
 		refStr, ok := labels[targetRefLabel]
 		if !ok {
@@ -91,31 +102,38 @@ func FromDefaultLabels(hosts docker.RegistryHosts) GetSources {
 			return nil, err
 		}
 
-		var layersDgst []digest.Digest
+		var neighboringLayers []ocispec.Descriptor
 		if l, ok := labels[targetImageLayersLabel]; ok {
 			layersStr := strings.Split(l, ",")
-			for _, l := range layersStr {
+			for i, l := range layersStr {
 				d, err := digest.Parse(l)
 				if err != nil {
 					return nil, err
 				}
 				if d.String() != target.String() {
-					layersDgst = append(layersDgst, d)
+					desc := ocispec.Descriptor{Digest: d}
+					if urls, ok := labels[targetImageURLsLabelPrefix+fmt.Sprintf("%d", i)]; ok {
+						desc.URLs = strings.Split(urls, ",")
+					}
+					neighboringLayers = append(neighboringLayers, desc)
 				}
 			}
 		}
 
-		var layers []ocispec.Descriptor
-		for _, dgst := range append([]digest.Digest{target}, layersDgst...) {
-			layers = append(layers, ocispec.Descriptor{Digest: dgst})
+		targetDesc := ocispec.Descriptor{
+			Digest:      target,
+			Annotations: labels,
+		}
+		if targetURLs, ok := labels[targetURLsLabel]; ok {
+			targetDesc.URLs = append(targetDesc.URLs, strings.Split(targetURLs, ",")...)
 		}
 
 		return []Source{
 			{
 				Hosts:    hosts,
 				Name:     refspec,
-				Target:   ocispec.Descriptor{Digest: target},
-				Manifest: ocispec.Manifest{Layers: layers},
+				Target:   targetDesc,
+				Manifest: ocispec.Manifest{Layers: append([]ocispec.Descriptor{targetDesc}, neighboringLayers...)},
 			},
 		}, nil
 	}
@@ -143,7 +161,7 @@ func AppendDefaultLabelsHandlerWrapper(ref string, prefetchSize int64) func(f im
 						c.Annotations[targetRefLabel] = ref
 						c.Annotations[targetDigestLabel] = c.Digest.String()
 						var layers string
-						for _, l := range children[i:] {
+						for i, l := range children[i:] {
 							if images.IsLayerType(l.MediaType) {
 								ls := fmt.Sprintf("%s,", l.Digest.String())
 								// This avoids the label hits the size limitation.
@@ -152,14 +170,102 @@ func AppendDefaultLabelsHandlerWrapper(ref string, prefetchSize int64) func(f im
 									break
 								}
 								layers += ls
+
+								// Store URLs of the neighbouring layer as well.
+								urlsKey := targetImageURLsLabelPrefix + fmt.Sprintf("%d", i)
+								c.Annotations[urlsKey] = appendWithValidation(urlsKey, l.URLs)
 							}
 						}
 						c.Annotations[targetImageLayersLabel] = strings.TrimSuffix(layers, ",")
 						c.Annotations[config.TargetPrefetchSizeLabel] = fmt.Sprintf("%d", prefetchSize)
+
+						// store URL in annotation to let containerd to pass it to the snapshotter
+						c.Annotations[targetURLsLabel] = appendWithValidation(targetURLsLabel, c.URLs)
 					}
 				}
 			}
 			return children, nil
 		})
 	}
+}
+
+func appendWithValidation(key string, values []string) string {
+	var v string
+	for _, u := range values {
+		s := fmt.Sprintf("%s,", u)
+		if err := labels.Validate(key, v+s); err != nil {
+			break
+		}
+		v += s
+	}
+	return strings.TrimSuffix(v, ",")
+}
+
+// TODO: switch to "github.com/containerd/containerd/pkg/snapshotters" once all tools using
+//
+//	stargz-snapshotter (e.g. k3s) move to containerd version where that pkg is available.
+const (
+	// targetImageLayersLabel is a label which contains layer digests contained in
+	// the target image and will be passed to snapshotters for preparing layers in
+	// parallel. Skipping some layers is allowed and only affects performance.
+	targetImageLayersLabelContainerd = "containerd.io/snapshot/cri.image-layers"
+)
+
+// AppendExtraLabelsHandler adds optional labels that aren't provided by
+// "github.com/containerd/containerd/pkg/snapshotters" but can be used for stargz snapshotter's extra functionalities.
+func AppendExtraLabelsHandler(prefetchSize int64, wrapper func(images.Handler) images.Handler) func(images.Handler) images.Handler {
+	return func(f images.Handler) images.Handler {
+		return images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+			children, err := wrapper(f).Handle(ctx, desc)
+			if err != nil {
+				return nil, err
+			}
+			switch desc.MediaType {
+			case ocispec.MediaTypeImageManifest, images.MediaTypeDockerSchema2Manifest:
+				for i := range children {
+					c := &children[i]
+					if !images.IsLayerType(c.MediaType) {
+						continue
+					}
+					if _, ok := c.Annotations[targetURLsLabel]; !ok { // nop if this key is already set
+						c.Annotations[targetURLsLabel] = appendWithValidation(targetURLsLabel, c.URLs)
+					}
+
+					if _, ok := c.Annotations[config.TargetPrefetchSizeLabel]; !ok { // nop if this key is already set
+						c.Annotations[config.TargetPrefetchSizeLabel] = fmt.Sprintf("%d", prefetchSize)
+					}
+
+					// Store URLs of the neighbouring layer as well.
+					nlayers, ok := c.Annotations[targetImageLayersLabelContainerd]
+					if !ok {
+						continue
+					}
+					for j, dstr := range strings.Split(nlayers, ",") {
+						d, err := digest.Parse(dstr)
+						if err != nil {
+							return nil, err
+						}
+						l, ok := layerFromDigest(children, d)
+						if !ok {
+							continue
+						}
+						urlsKey := targetImageURLsLabelPrefix + fmt.Sprintf("%d", j)
+						if _, ok := c.Annotations[urlsKey]; !ok { // nop if this key is already set
+							c.Annotations[urlsKey] = appendWithValidation(urlsKey, l.URLs)
+						}
+					}
+				}
+			}
+			return children, nil
+		})
+	}
+}
+
+func layerFromDigest(layers []ocispec.Descriptor, target digest.Digest) (ocispec.Descriptor, bool) {
+	for _, l := range layers {
+		if l.Digest == target {
+			return l, images.IsLayerType(l.MediaType)
+		}
+	}
+	return ocispec.Descriptor{}, false
 }

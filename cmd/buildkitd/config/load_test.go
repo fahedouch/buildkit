@@ -1,0 +1,310 @@
+package config
+
+import (
+	"bytes"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/moby/buildkit/util/db/compaction"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestLoadGCPolicyInvalidQuote(t *testing.T) {
+	for _, tc := range []struct {
+		field   string
+		wantErr string
+	}{
+		{"keepDuration", "invalid duration"},
+		{"reservedSpace", "invalid disk space"},
+		{"maxUsedSpace", "invalid disk space"},
+		{"minFreeSpace", "invalid disk space"},
+	} {
+		for _, value := range []string{`'"'`, `"\""`} {
+			t.Run(tc.field+"/"+value, func(t *testing.T) {
+				config := fmt.Sprintf("[[worker.oci.gcpolicy]]\n%s = %s\n", tc.field, value)
+				_, err := Load(strings.NewReader(config))
+				require.ErrorContains(t, err, tc.wantErr)
+			})
+		}
+	}
+}
+
+func TestCompactionConfig(t *testing.T) {
+	for _, enabled := range []string{"", "[compaction]\nenabled = false", "[compaction]\nenabled = true"} {
+		cfg, err := Load(strings.NewReader(enabled))
+		require.NoError(t, err)
+		require.Equal(t, strings.Contains(enabled, "true"), cfg.Compaction.Enabled)
+		policy, err := cfg.Compaction.Policy()
+		require.NoError(t, err)
+		expected := compaction.DefaultConfig()
+		expected.ManualOnly = !cfg.Compaction.Enabled
+		require.Equal(t, expected, policy)
+	}
+	cfg, err := Load(strings.NewReader(`[compaction]
+enabled = true
+idleTimeout = "5m"
+maxRetry = 0
+writesPerCheck = 1234
+sizeWatermark = 1073741824
+sizeGrowthPercent = 250
+minReclaimBytes = 536870912
+minReclaimPercent = 40
+minReclaimPercentFloor = 15
+`))
+	require.NoError(t, err)
+	policy, err := cfg.Compaction.Policy()
+	require.NoError(t, err)
+	require.Equal(t, 5*time.Minute, policy.IdleTimeout)
+	require.Zero(t, policy.MaxRetry)
+	require.Equal(t, uint64(1234), policy.WritesPerCheck)
+	require.Equal(t, int64(1073741824), policy.SizeWatermark)
+	require.Equal(t, int64(250), policy.SizeGrowthPercent)
+	require.Equal(t, int64(536870912), policy.MinReclaimBytes)
+	require.Equal(t, int64(40), policy.MinReclaimPercent)
+	require.Equal(t, int64(15), policy.MinReclaimPercentFloor)
+
+	cfg, err = Load(strings.NewReader("[compaction]\nminReclaimPercent = 5\n"))
+	require.NoError(t, err)
+	policy, err = cfg.Compaction.Policy()
+	require.NoError(t, err)
+	require.Equal(t, int64(5), policy.MinReclaimPercentFloor)
+}
+
+func TestInvalidCompactionConfig(t *testing.T) {
+	for _, setting := range []string{
+		`idleTimeout = "0s"`,
+		`idleTimeout = "-1s"`,
+		`maxRetry = -1`,
+		`writesPerCheck = 0`,
+		`sizeWatermark = 0`,
+		`sizeWatermark = -1`,
+		`sizeGrowthPercent = 0`,
+		`sizeGrowthPercent = -1`,
+		`minReclaimBytes = 0`,
+		`minReclaimBytes = -1`,
+		`minReclaimPercent = 0`,
+		`minReclaimPercent = -1`,
+		`minReclaimPercent = 101`,
+		`minReclaimPercentFloor = 0`,
+		`minReclaimPercentFloor = -1`,
+		`minReclaimPercentFloor = 101`,
+		"minReclaimPercent = 5\nminReclaimPercentFloor = 10",
+	} {
+		t.Run(setting, func(t *testing.T) {
+			cfg, err := Load(strings.NewReader("[compaction]\nenabled = true\n" + setting))
+			require.NoError(t, err)
+			_, err = cfg.Compaction.Policy()
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestLoad(t *testing.T) {
+	const testConfig = `
+root = "/foo/bar"
+debug=true
+trace=true
+insecure-entitlements = ["security.insecure"]
+proxyNetwork = true
+
+[gc]
+enabled=true
+
+[grpc]
+address=["buildkit.sock"]
+debugAddress="debug.sock"
+gid=1234
+[grpc.tls]
+cert="mycert.pem"
+
+[otel]
+socketPath="/tmp/otel-grpc.sock"
+
+[worker.oci]
+enabled=true
+snapshotter="overlay"
+rootless=true
+gc=false
+gckeepstorage=123456789
+[worker.oci.labels]
+foo="bar"
+"aa.bb.cc"="baz"
+
+[worker.containerd]
+namespace="non-default"
+platforms=["linux/amd64"]
+address="containerd.sock"
+hypervIsolation=true
+[worker.containerd.runtime]
+name="exotic"
+path="/usr/bin/exotic"
+options.foo="bar"
+[[worker.containerd.gcpolicy]]
+all=true
+filters=["foo==bar"]
+reservedSpace=20
+keepDuration=3600
+[[worker.containerd.gcpolicy]]
+reservedSpace="40MB"
+keepDuration=7200
+[[worker.containerd.gcpolicy]]
+reservedSpace="20%"
+keepDuration="24h"
+[[worker.containerd.gcpolicy]]
+reservedSpace="10GB"
+maxUsedSpace="80%"
+minFreeSpace="10%"
+
+[registry."docker.io"]
+mirrors=["hub.docker.io"]
+http=true
+insecure=true
+ca=["myca.pem"]
+tlsconfigdir=["/etc/buildkitd/myregistry"]
+[[registry."docker.io".keypair]]
+key="key.pem"
+cert="cert.pem"
+
+[dns]
+nameservers=["1.1.1.1","8.8.8.8"]
+options=["edns0"]
+searchDomains=["example.com"]
+
+[system]
+sessionAuthTimeout="60s"
+`
+
+	cfg, err := Load(bytes.NewBuffer([]byte(testConfig)))
+	require.NoError(t, err)
+
+	require.Equal(t, "/foo/bar", cfg.Root)
+	require.Equal(t, true, cfg.Debug)
+	require.Equal(t, true, cfg.Trace)
+	require.Equal(t, "security.insecure", cfg.Entitlements[0])
+	require.True(t, cfg.ProxyNetwork)
+
+	require.Equal(t, "buildkit.sock", cfg.GRPC.Address[0])
+	require.Equal(t, "debug.sock", cfg.GRPC.DebugAddress)
+	require.Nil(t, cfg.GRPC.UID)
+	require.NotNil(t, cfg.GRPC.GID)
+	require.Equal(t, 1234, *cfg.GRPC.GID)
+	require.Equal(t, "mycert.pem", cfg.GRPC.TLS.Cert)
+
+	require.Equal(t, "/tmp/otel-grpc.sock", cfg.OTEL.SocketPath)
+
+	require.NotNil(t, cfg.Workers.OCI.Enabled)
+	require.Equal(t, int64(123456789), cfg.Workers.OCI.GCKeepStorage.Bytes)
+	require.Equal(t, true, *cfg.Workers.OCI.Enabled)
+	require.Equal(t, "overlay", cfg.Workers.OCI.Snapshotter)
+	require.Equal(t, true, cfg.Workers.OCI.Rootless)
+	require.Equal(t, false, *cfg.Workers.OCI.GC)
+
+	require.Equal(t, "bar", cfg.Workers.OCI.Labels["foo"])
+	require.Equal(t, "baz", cfg.Workers.OCI.Labels["aa.bb.cc"])
+
+	require.Nil(t, cfg.Workers.Containerd.Enabled)
+	require.Equal(t, 1, len(cfg.Workers.Containerd.Platforms))
+	require.Equal(t, "containerd.sock", cfg.Workers.Containerd.Address)
+	require.True(t, cfg.Workers.Containerd.HyperVIsolation)
+
+	require.Equal(t, 0, len(cfg.Workers.OCI.GCPolicy))
+	require.Equal(t, "non-default", cfg.Workers.Containerd.Namespace)
+	require.Equal(t, "exotic", cfg.Workers.Containerd.Runtime.Name)
+	require.Equal(t, "/usr/bin/exotic", cfg.Workers.Containerd.Runtime.Path)
+	require.Equal(t, "bar", cfg.Workers.Containerd.Runtime.Options["foo"])
+	require.Equal(t, 4, len(cfg.Workers.Containerd.GCPolicy))
+
+	require.Nil(t, cfg.Workers.Containerd.GC)
+	require.Equal(t, true, cfg.Workers.Containerd.GCPolicy[0].All)
+	require.Equal(t, 1, len(cfg.Workers.Containerd.GCPolicy[0].Filters))
+	require.Equal(t, int64(20), cfg.Workers.Containerd.GCPolicy[0].ReservedSpace.Bytes)
+	require.Equal(t, time.Duration(3600), cfg.Workers.Containerd.GCPolicy[0].KeepDuration.Duration/time.Second)
+
+	require.Equal(t, false, cfg.Workers.Containerd.GCPolicy[1].All)
+	require.Equal(t, int64(40*1024*1024), cfg.Workers.Containerd.GCPolicy[1].ReservedSpace.Bytes)
+	require.Equal(t, time.Duration(7200), cfg.Workers.Containerd.GCPolicy[1].KeepDuration.Duration/time.Second)
+	require.Equal(t, 0, len(cfg.Workers.Containerd.GCPolicy[1].Filters))
+
+	require.Equal(t, false, cfg.Workers.Containerd.GCPolicy[2].All)
+	require.Equal(t, int64(20), cfg.Workers.Containerd.GCPolicy[2].ReservedSpace.Percentage)
+	require.Equal(t, time.Duration(86400), cfg.Workers.Containerd.GCPolicy[2].KeepDuration.Duration/time.Second)
+
+	require.Equal(t, false, cfg.Workers.Containerd.GCPolicy[3].All)
+	require.Equal(t, int64(10*1024*1024*1024), cfg.Workers.Containerd.GCPolicy[3].ReservedSpace.Bytes)
+	require.Equal(t, int64(80), cfg.Workers.Containerd.GCPolicy[3].MaxUsedSpace.Percentage)
+	require.Equal(t, int64(10), cfg.Workers.Containerd.GCPolicy[3].MinFreeSpace.Percentage)
+
+	require.Equal(t, true, *cfg.Registries["docker.io"].PlainHTTP)
+	require.Equal(t, true, *cfg.Registries["docker.io"].Insecure)
+	require.Equal(t, "hub.docker.io", cfg.Registries["docker.io"].Mirrors[0])
+	require.Equal(t, []string{"myca.pem"}, cfg.Registries["docker.io"].RootCAs)
+	require.Equal(t, []string{"/etc/buildkitd/myregistry"}, cfg.Registries["docker.io"].TLSConfigDir)
+	require.Equal(t, "key.pem", cfg.Registries["docker.io"].KeyPairs[0].Key)
+	require.Equal(t, "cert.pem", cfg.Registries["docker.io"].KeyPairs[0].Certificate)
+
+	require.NotNil(t, cfg.DNS)
+	require.Equal(t, []string{"1.1.1.1", "8.8.8.8"}, cfg.DNS.Nameservers)
+	require.Equal(t, []string{"example.com"}, cfg.DNS.SearchDomains)
+	require.Equal(t, []string{"edns0"}, cfg.DNS.Options)
+
+	require.NotNil(t, cfg.System)
+	require.Equal(t, 60*time.Second, cfg.System.SessionAuthTimeout.Duration)
+}
+
+func TestLoadHistoryMaxEntries(t *testing.T) {
+	tests := []struct {
+		name    string
+		toml    string
+		wantSet bool
+		want    int64
+	}{
+		{name: "unset", toml: "[history]\nmaxAge = 172800\n"},
+		{name: "disabled", toml: "[history]\nmaxEntries = 0\n", wantSet: true, want: 0},
+		{name: "configured", toml: "[history]\nmaxEntries = 12\n", wantSet: true, want: 12},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(bytes.NewBufferString(tc.toml))
+			require.NoError(t, err)
+			require.NotNil(t, cfg.History)
+			if tc.wantSet {
+				require.NotNil(t, cfg.History.MaxEntries)
+				require.Equal(t, tc.want, *cfg.History.MaxEntries)
+			} else {
+				require.Nil(t, cfg.History.MaxEntries)
+			}
+		})
+	}
+}
+
+func TestLoadSessionAuthTimeout(t *testing.T) {
+	tests := []struct {
+		name    string
+		toml    string
+		wantSet bool
+		want    time.Duration
+	}{
+		{name: "unset", toml: "[system]\n"},
+		{name: "disabled", toml: "[system]\nsessionAuthTimeout = 0\n", wantSet: true, want: 0},
+		{name: "configured", toml: "[system]\nsessionAuthTimeout = 300\n", wantSet: true, want: 300 * time.Second},
+		{name: "duration-string", toml: "[system]\nsessionAuthTimeout = \"60s\"\n", wantSet: true, want: 60 * time.Second},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(bytes.NewBufferString(tc.toml))
+			require.NoError(t, err)
+			require.NotNil(t, cfg.System)
+			if tc.wantSet {
+				require.NotNil(t, cfg.System.SessionAuthTimeout)
+				require.Equal(t, tc.want, cfg.System.SessionAuthTimeout.Duration)
+			} else {
+				require.Nil(t, cfg.System.SessionAuthTimeout)
+			}
+		})
+	}
+}

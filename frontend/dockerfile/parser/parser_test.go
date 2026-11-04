@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -56,12 +55,12 @@ func TestParseCases(t *testing.T) {
 			result, err := Parse(df)
 			require.NoError(t, err, dockerfile)
 
-			content, err := ioutil.ReadFile(resultfile)
+			content, err := os.ReadFile(resultfile)
 			require.NoError(t, err, resultfile)
 
 			if runtime.GOOS == "windows" {
 				// CRLF --> CR to match Unix behavior
-				content = bytes.Replace(content, []byte{'\x0d', '\x0a'}, []byte{'\x0a'}, -1)
+				content = bytes.ReplaceAll(content, []byte{'\x0d', '\x0a'}, []byte{'\x0a'})
 			}
 			require.Equal(t, string(content), result.AST.Dump()+"\n", dockerfile)
 		})
@@ -129,13 +128,17 @@ func TestParseIncludesLineNumbers(t *testing.T) {
 	}
 	for i, child := range ast.Children {
 		msg := fmt.Sprintf("Child %d", i)
-		require.Equal(t, expected[i], []int{child.StartLine, child.EndLine}, msg)
+		res := []int{child.StartLine, child.EndLine}
+		require.Equal(t, expected[i], res, msg)
 	}
 }
 
 func TestParseWarnsOnEmptyContinutationLine(t *testing.T) {
 	dockerfile := bytes.NewBufferString(`
 FROM alpine:3.6
+
+RUN valid \
+    continuation
 
 RUN something \
 
@@ -146,6 +149,7 @@ RUN something \
 RUN another \
 
     thing
+
 RUN non-indented \
 # this is a comment
    after-comment
@@ -158,11 +162,11 @@ RUN indented \
 	result, err := Parse(dockerfile)
 	require.NoError(t, err)
 	warnings := result.Warnings
-	require.Equal(t, 3, len(warnings))
-	require.Contains(t, warnings[0], "Empty continuation line found in")
-	require.Contains(t, warnings[0], "RUN something     following     more")
-	require.Contains(t, warnings[1], "RUN another     thing")
-	require.Contains(t, warnings[2], "will become errors in a future release")
+	require.Equal(t, 2, len(warnings))
+	require.Contains(t, warnings[0].Short, "Empty continuation line found in")
+	require.Contains(t, warnings[0].Short, "RUN something     following     more")
+	require.Contains(t, warnings[1].Short, "RUN another     thing")
+	require.Contains(t, string(warnings[0].Detail[0]), "will become errors in a future release")
 }
 
 func TestParseReturnsScannerErrors(t *testing.T) {

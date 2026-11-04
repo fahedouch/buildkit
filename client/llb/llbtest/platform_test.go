@@ -1,17 +1,16 @@
 package llbtest
 
 import (
-	"context"
 	"strings"
 	"testing"
 
-	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/llbsolver"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/system"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -24,21 +23,21 @@ func TestCustomPlatform(t *testing.T) {
 		Run(llb.Shlex("bax"), llb.Windows).
 		Run(llb.Shlex("bay"))
 
-	def, err := s.Marshal(context.TODO())
+	def, err := s.Marshal(t.Context())
 	require.NoError(t, err)
 
-	e, err := llbsolver.Load(def.ToPB())
+	e, err := llbsolver.Load(t.Context(), def.ToPB(), nil)
 	require.NoError(t, err)
 
-	require.Equal(t, depth(e), 5)
+	require.Equal(t, 5, depth(e))
 
-	expected := specs.Platform{OS: "windows", Architecture: "amd64"}
+	expected := ocispecs.Platform{OS: "windows", Architecture: "amd64"}
 	require.Equal(t, expected, platform(e))
 	e = parent(e, 0)
 	require.Equal(t, expected, platform(e))
 	e = parent(e, 0)
 
-	expected = specs.Platform{OS: "linux", Architecture: "arm", Variant: "v7"}
+	expected = ocispecs.Platform{OS: "linux", Architecture: "arm", Variant: "v7"}
 	require.Equal(t, expected, platform(e))
 	e = parent(e, 0)
 	require.Equal(t, expected, platform(e))
@@ -53,15 +52,18 @@ func TestDefaultPlatform(t *testing.T) {
 
 	s := llb.Image("foo").Run(llb.Shlex("bar"))
 
-	def, err := s.Marshal(context.TODO())
+	def, err := s.Marshal(t.Context())
 	require.NoError(t, err)
 
-	e, err := llbsolver.Load(def.ToPB())
+	e, err := llbsolver.Load(t.Context(), def.ToPB(), nil)
 	require.NoError(t, err)
 
-	require.Equal(t, depth(e), 2)
+	require.Equal(t, 2, depth(e))
 
-	expected := platforms.DefaultSpec()
+	// needs extra normalize for default spec
+	// https://github.com/moby/buildkit/pull/2427#issuecomment-952301867
+	expected := platforms.Normalize(platforms.DefaultSpec())
+
 	require.Equal(t, expected, platform(e))
 	require.Equal(t, []string{"bar"}, args(e))
 	e = parent(e, 0)
@@ -74,13 +76,13 @@ func TestPlatformOnMarshal(t *testing.T) {
 
 	s := llb.Image("image1").Run(llb.Shlex("bar"))
 
-	def, err := s.Marshal(context.TODO(), llb.Windows)
+	def, err := s.Marshal(t.Context(), llb.Windows)
 	require.NoError(t, err)
 
-	e, err := llbsolver.Load(def.ToPB())
+	e, err := llbsolver.Load(t.Context(), def.ToPB(), nil)
 	require.NoError(t, err)
 
-	expected := specs.Platform{OS: "windows", Architecture: "amd64"}
+	expected := ocispecs.Platform{OS: "windows", Architecture: "amd64"}
 	require.Equal(t, expected, platform(e))
 	e = parent(e, 0)
 	require.Equal(t, expected, platform(e))
@@ -94,15 +96,15 @@ func TestPlatformMixed(t *testing.T) {
 	s2 := llb.Image("image2", llb.LinuxArmel).Run(llb.Shlex("cmd-sub"))
 	s1.AddMount("/mnt", s2.Root())
 
-	def, err := s1.Marshal(context.TODO(), llb.LinuxAmd64)
+	def, err := s1.Marshal(t.Context(), llb.LinuxAmd64)
 	require.NoError(t, err)
 
-	e, err := llbsolver.Load(def.ToPB())
+	e, err := llbsolver.Load(t.Context(), def.ToPB(), nil)
 	require.NoError(t, err)
 
-	require.Equal(t, depth(e), 4)
+	require.Equal(t, 4, depth(e))
 
-	expectedAmd := specs.Platform{OS: "linux", Architecture: "amd64"}
+	expectedAmd := ocispecs.Platform{OS: "linux", Architecture: "amd64"}
 	require.Equal(t, []string{"cmd-main"}, args(e))
 	require.Equal(t, expectedAmd, platform(e))
 
@@ -110,7 +112,7 @@ func TestPlatformMixed(t *testing.T) {
 	require.Equal(t, "docker-image://docker.io/library/image1:latest", id(e1))
 	require.Equal(t, expectedAmd, platform(e1))
 
-	expectedArm := specs.Platform{OS: "linux", Architecture: "arm", Variant: "v6"}
+	expectedArm := ocispecs.Platform{OS: "linux", Architecture: "arm", Variant: "v6"}
 	e2 := mount(e, "/mnt")
 	require.Equal(t, []string{"cmd-sub"}, args(e2))
 	require.Equal(t, expectedArm, platform(e2))
@@ -124,9 +126,9 @@ func TestFallbackPath(t *testing.T) {
 
 	// With no caps we expect no PATH but also no requirement for
 	// the cap.
-	def, err := llb.Scratch().Run(llb.Shlex("cmd")).Marshal(context.TODO(), llb.LinuxAmd64)
+	def, err := llb.Scratch().Run(llb.Shlex("cmd")).Marshal(t.Context(), llb.LinuxAmd64)
 	require.NoError(t, err)
-	e, err := llbsolver.Load(def.ToPB())
+	e, err := llbsolver.Load(t.Context(), def.ToPB(), nil)
 	require.NoError(t, err)
 	require.False(t, def.Metadata[e.Vertex.Digest()].Caps[pb.CapExecMetaSetsDefaultPath])
 	_, ok := getenv(e, "PATH")
@@ -136,9 +138,9 @@ func TestFallbackPath(t *testing.T) {
 	// no requirement for the cap.
 	cs := pb.Caps.CapSet(nil)
 	require.Error(t, cs.Supports(pb.CapExecMetaSetsDefaultPath))
-	def, err = llb.Scratch().Run(llb.Shlex("cmd")).Marshal(context.TODO(), llb.LinuxAmd64, llb.WithCaps(cs))
+	def, err = llb.Scratch().Run(llb.Shlex("cmd")).Marshal(t.Context(), llb.LinuxAmd64, llb.WithCaps(cs))
 	require.NoError(t, err)
-	e, err = llbsolver.Load(def.ToPB())
+	e, err = llbsolver.Load(t.Context(), def.ToPB(), nil)
 	require.NoError(t, err)
 	require.False(t, def.Metadata[e.Vertex.Digest()].Caps[pb.CapExecMetaSetsDefaultPath])
 	v, ok := getenv(e, "PATH")
@@ -150,9 +152,9 @@ func TestFallbackPath(t *testing.T) {
 	// present and empty), but also require the cap.
 	cs = pb.Caps.CapSet(pb.Caps.All())
 	require.NoError(t, cs.Supports(pb.CapExecMetaSetsDefaultPath))
-	def, err = llb.Scratch().Run(llb.Shlex("cmd")).Marshal(context.TODO(), llb.LinuxAmd64, llb.WithCaps(cs))
+	def, err = llb.Scratch().Run(llb.Shlex("cmd")).Marshal(t.Context(), llb.LinuxAmd64, llb.WithCaps(cs))
 	require.NoError(t, err)
-	e, err = llbsolver.Load(def.ToPB())
+	e, err = llbsolver.Load(t.Context(), def.ToPB(), nil)
 	require.NoError(t, err)
 	require.True(t, def.Metadata[e.Vertex.Digest()].Caps[pb.CapExecMetaSetsDefaultPath])
 	_, ok = getenv(e, "PATH")
@@ -166,9 +168,9 @@ func TestFallbackPath(t *testing.T) {
 		{llb.WithCaps(pb.Caps.CapSet(nil))},
 		{llb.WithCaps(pb.Caps.CapSet(pb.Caps.All()))},
 	} {
-		def, err = llb.Scratch().AddEnv("PATH", "foo").Run(llb.Shlex("cmd")).Marshal(context.TODO(), append(cos, llb.LinuxAmd64)...)
+		def, err = llb.Scratch().AddEnv("PATH", "foo").Run(llb.Shlex("cmd")).Marshal(t.Context(), append(cos, llb.LinuxAmd64)...)
 		require.NoError(t, err)
-		e, err = llbsolver.Load(def.ToPB())
+		e, err = llbsolver.Load(t.Context(), def.ToPB(), nil)
 		require.NoError(t, err)
 		// pb.CapExecMetaSetsDefaultPath setting is irrelevant (and variable).
 		v, ok = getenv(e, "PATH")
@@ -181,10 +183,9 @@ func toOp(e solver.Edge) *pb.Op {
 	return e.Vertex.Sys().(*pb.Op)
 }
 
-func platform(e solver.Edge) specs.Platform {
-	op := toOp(e)
-	p := *op.Platform
-	return specs.Platform{
+func platform(e solver.Edge) ocispecs.Platform {
+	p := toOp(e).Platform
+	return ocispecs.Platform{
 		OS:           p.OS,
 		Architecture: p.Architecture,
 		Variant:      p.Variant,
@@ -227,8 +228,8 @@ func getenv(e solver.Edge, k string) (string, bool) {
 	env := toOp(e).GetExec().Meta.Env
 	k = k + "="
 	for _, e := range env {
-		if strings.HasPrefix(e, k) {
-			return strings.TrimPrefix(e, k), true
+		if after, ok := strings.CutPrefix(e, k); ok {
+			return after, true
 		}
 	}
 	return "", false

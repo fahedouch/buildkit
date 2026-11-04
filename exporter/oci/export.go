@@ -2,36 +2,46 @@ package oci
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
 
-	archiveexporter "github.com/containerd/containerd/images/archive"
-	"github.com/containerd/containerd/leases"
-	"github.com/docker/distribution/reference"
+	archiveexporter "github.com/containerd/containerd/v2/core/images/archive"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/distribution/reference"
 	"github.com/moby/buildkit/cache"
+	cacheconfig "github.com/moby/buildkit/cache/config"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/exporter"
 	"github.com/moby/buildkit/exporter/containerimage"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/session"
+	sessioncontent "github.com/moby/buildkit/session/content"
 	"github.com/moby/buildkit/session/filesync"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/grpcerrors"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/progress"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 )
 
 type ExporterVariant string
 
 const (
-	keyImageName        = "name"
-	keyLayerCompression = "compression"
-	VariantOCI          = "oci"
-	VariantDocker       = "docker"
-	ociTypes            = "oci-mediatypes"
+	VariantOCI    = client.ExporterOCI
+	VariantDocker = client.ExporterDocker
+)
+
+const (
+	keyTar = "tar"
 )
 
 type Opt struct {
@@ -50,36 +60,36 @@ func New(opt Opt) (exporter.Exporter, error) {
 	return im, nil
 }
 
-func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exporter.ExporterInstance, error) {
-	var ot *bool
+func (e *imageExporter) Resolve(ctx context.Context, id int, opt map[string]string) (exporter.ExporterInstance, error) {
 	i := &imageExporterInstance{
-		imageExporter:    e,
-		layerCompression: compression.Default,
+		imageExporter: e,
+		id:            id,
+		attrs:         opt,
+		tar:           true,
+		opts: containerimage.ImageCommitOpts{
+			RefCfg: cacheconfig.RefConfig{
+				Compression: compression.New(compression.Default),
+			},
+		},
 	}
+
+	opt, err := i.opts.Load(ctx, opt)
+	if err != nil {
+		return nil, err
+	}
+
 	for k, v := range opt {
 		switch k {
-		case keyImageName:
-			i.name = v
-		case keyLayerCompression:
-			switch v {
-			case "gzip":
-				i.layerCompression = compression.Gzip
-			case "uncompressed":
-				i.layerCompression = compression.Uncompressed
-			default:
-				return nil, errors.Errorf("unsupported layer compression type: %v", v)
-			}
-		case ociTypes:
-			ot = new(bool)
+		case keyTar:
 			if v == "" {
-				*ot = true
+				i.tar = true
 				continue
 			}
 			b, err := strconv.ParseBool(v)
 			if err != nil {
 				return nil, errors.Wrapf(err, "non-bool value specified for %s", k)
 			}
-			*ot = b
+			i.tar = b
 		default:
 			if i.meta == nil {
 				i.meta = make(map[string][]byte)
@@ -87,74 +97,118 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 			i.meta[k] = []byte(v)
 		}
 	}
-	if ot == nil {
-		i.ociTypes = e.opt.Variant == VariantOCI
-	} else {
-		i.ociTypes = *ot
-	}
 	return i, nil
 }
 
 type imageExporterInstance struct {
 	*imageExporter
-	meta             map[string][]byte
-	name             string
-	ociTypes         bool
-	layerCompression compression.Type
+	id    int
+	attrs map[string]string
+
+	opts containerimage.ImageCommitOpts
+	tar  bool
+	meta map[string][]byte
+}
+
+func (e *imageExporterInstance) ID() int {
+	return e.id
 }
 
 func (e *imageExporterInstance) Name() string {
-	return "exporting to oci image format"
+	return fmt.Sprintf("exporting to %s image format", e.opt.Variant)
 }
 
-func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source, sessionID string) (map[string]string, error) {
+func (e *imageExporterInstance) Type() string {
+	return string(e.opt.Variant)
+}
+
+func (e *imageExporterInstance) Attrs() map[string]string {
+	return e.attrs
+}
+
+func (e *imageExporterInstance) Config() *exporter.Config {
+	return exporter.NewConfigWithCompression(e.opts.RefCfg.Compression)
+}
+
+func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source, buildInfo exporter.ExportBuildInfo) (_ map[string]string, _ exporter.FinalizeFunc, descref exporter.DescriptorReference, err error) {
 	if e.opt.Variant == VariantDocker && len(src.Refs) > 0 {
-		return nil, errors.Errorf("docker exporter does not currently support exporting manifest lists")
+		return nil, nil, nil, errors.New("docker exporter does not currently support exporting manifest lists")
 	}
 
+	src = src.Clone()
 	if src.Metadata == nil {
 		src.Metadata = make(map[string][]byte)
 	}
-	for k, v := range e.meta {
-		src.Metadata[k] = v
+	maps.Copy(src.Metadata, e.meta)
+
+	opts := e.opts
+	as, _, err := containerimage.ParseAnnotations(src.Metadata)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	opts.Annotations = opts.Annotations.Merge(as)
+	opts.SetOCITypesDefault(e.defaultOCITypes(buildInfo.CompatibilityVersion, src))
+	opts.SetOCIArtifactDefault(containerimage.DefaultOCIArtifact(buildInfo.CompatibilityVersion, &opts))
+	if err := opts.Validate(); err != nil {
+		return nil, nil, nil, err
 	}
 
 	ctx, done, err := leaseutil.WithLease(ctx, e.opt.LeaseManager, leaseutil.MakeTemporary)
 	if err != nil {
-		return nil, err
-	}
-	defer done(context.TODO())
-
-	desc, err := e.opt.ImageWriter.Commit(ctx, src, e.ociTypes, e.layerCompression, sessionID)
-	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	defer func() {
-		e.opt.ImageWriter.ContentStore().Delete(context.TODO(), desc.Digest)
+		if descref == nil {
+			done(context.WithoutCancel(ctx))
+		}
 	}()
+
+	desc, _, err := e.opt.ImageWriter.Commit(ctx, src, buildInfo.SessionID, buildInfo.InlineCache, &opts, buildInfo.CompatibilityVersion, e.Type())
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer func() {
+		if err == nil {
+			descref = containerimage.NewDescriptorReference(*desc, done)
+		}
+	}()
+
 	if desc.Annotations == nil {
 		desc.Annotations = map[string]string{}
 	}
-	desc.Annotations[ocispec.AnnotationCreated] = time.Now().UTC().Format(time.RFC3339)
+	if _, ok := desc.Annotations[ocispecs.AnnotationCreated]; !ok {
+		tm := time.Now()
+		if opts.Epoch != nil && opts.Epoch.Value != nil {
+			tm = *opts.Epoch.Value
+		}
+		desc.Annotations[ocispecs.AnnotationCreated] = tm.UTC().Format(time.RFC3339)
+	}
 
 	resp := make(map[string]string)
-	resp["containerimage.digest"] = desc.Digest.String()
-	if v, ok := desc.Annotations["config.digest"]; ok {
-		resp["containerimage.config.digest"] = v
-		delete(desc.Annotations, "config.digeest")
+
+	resp[exptypes.ExporterImageDigestKey] = desc.Digest.String()
+	if v, ok := desc.Annotations[exptypes.ExporterConfigDigestKey]; ok {
+		resp[exptypes.ExporterImageConfigDigestKey] = v
+		delete(desc.Annotations, exptypes.ExporterConfigDigestKey)
 	}
 
-	if n, ok := src.Metadata["image.name"]; e.name == "*" && ok {
-		e.name = string(n)
-	}
-
-	names, err := normalizedNames(e.name)
+	dtdesc, err := json.Marshal(desc)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
+	}
+	resp[exptypes.ExporterImageDescriptorKey] = base64.StdEncoding.EncodeToString(dtdesc)
+
+	if n, ok := src.Metadata["image.name"]; e.opts.ImageName == "*" && ok {
+		e.opts.ImageName = string(n)
+	}
+
+	names, err := normalizedNames(e.opts.ImageName)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	if len(names) != 0 {
-		resp["image.name"] = strings.Join(names, ",")
+		resp[exptypes.ExporterImageNameKey] = strings.Join(names, ",")
 	}
 
 	expOpts := []archiveexporter.ExportOpt{archiveexporter.WithManifest(*desc, names...)}
@@ -163,86 +217,93 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source,
 		expOpts = append(expOpts, archiveexporter.WithAllPlatforms(), archiveexporter.WithSkipDockerManifest())
 	case VariantDocker:
 	default:
-		return nil, errors.Errorf("invalid variant %q", e.opt.Variant)
+		return nil, nil, nil, errors.Errorf("invalid variant %q", e.opt.Variant)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	timeoutCtx, cancel := context.WithCancelCause(ctx)
+	timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, 5*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
-	caller, err := e.opt.SessionManager.Get(timeoutCtx, sessionID, false)
+	caller, err := e.opt.SessionManager.Get(timeoutCtx, buildInfo.SessionID, false)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
-	w, err := filesync.CopyFileWriter(ctx, resp, caller)
-	if err != nil {
-		return nil, err
-	}
-
-	mprovider := contentutil.NewMultiProvider(e.opt.ImageWriter.ContentStore())
+	var refs []cache.ImmutableRef
 	if src.Ref != nil {
-		remote, err := src.Ref.GetRemote(ctx, false, e.layerCompression, session.NewGroup(sessionID))
-		if err != nil {
-			return nil, err
-		}
-		// unlazy before tar export as the tar writer does not handle
-		// layer blobs in parallel (whereas unlazy does)
-		if unlazier, ok := remote.Provider.(cache.Unlazier); ok {
-			if err := unlazier.Unlazy(ctx); err != nil {
-				return nil, err
-			}
-		}
-		for _, desc := range remote.Descriptors {
-			mprovider.Add(desc.Digest, remote.Provider)
-		}
+		refs = append(refs, src.Ref)
 	}
-	if len(src.Refs) > 0 {
-		for _, r := range src.Refs {
-			remote, err := r.GetRemote(ctx, false, e.layerCompression, session.NewGroup(sessionID))
-			if err != nil {
-				return nil, err
+	for _, ref := range src.Refs {
+		refs = append(refs, ref)
+	}
+	eg, egCtx := errgroup.WithContext(ctx)
+	mprovider := contentutil.NewMultiProvider(e.opt.ImageWriter.ContentStore())
+	for _, ref := range refs {
+		eg.Go(func() error {
+			if ref == nil {
+				return nil
 			}
+			remotes, err := ref.GetRemotes(egCtx, false, e.opts.RefCfg, false, session.NewGroup(buildInfo.SessionID))
+			if err != nil {
+				return err
+			}
+			remote := remotes[0]
 			if unlazier, ok := remote.Provider.(cache.Unlazier); ok {
-				if err := unlazier.Unlazy(ctx); err != nil {
-					return nil, err
+				if err := unlazier.Unlazy(egCtx); err != nil {
+					return err
 				}
 			}
 			for _, desc := range remote.Descriptors {
 				mprovider.Add(desc.Digest, remote.Provider)
 			}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, nil, nil, err
+	}
+
+	if e.tar {
+		w, err := filesync.CopyFileWriter(ctx, resp, e.id, caller)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		report := progress.OneOff(ctx, "sending tarball")
+		if err := archiveexporter.Export(ctx, mprovider, w, expOpts...); err != nil {
+			w.Close()
+			if grpcerrors.Code(err) == codes.AlreadyExists {
+				return resp, nil, nil, report(nil)
+			}
+			return nil, nil, nil, report(err)
+		}
+		err = w.Close()
+		if grpcerrors.Code(err) == codes.AlreadyExists {
+			return resp, nil, nil, report(nil)
+		}
+		if err != nil {
+			return nil, nil, nil, report(err)
+		}
+		report(nil)
+	} else {
+		store := sessioncontent.NewCallerStore(caller, "export")
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		err := contentutil.CopyChain(ctx, store, mprovider, *desc)
+		if err != nil {
+			return nil, nil, nil, err
 		}
 	}
 
-	report := oneOffProgress(ctx, "sending tarball")
-	if err := archiveexporter.Export(ctx, mprovider, w, expOpts...); err != nil {
-		w.Close()
-		if grpcerrors.Code(err) == codes.AlreadyExists {
-			return resp, report(nil)
-		}
-		return nil, report(err)
-	}
-	err = w.Close()
-	if grpcerrors.Code(err) == codes.AlreadyExists {
-		return resp, report(nil)
-	}
-	return resp, report(err)
+	return resp, nil, nil, nil
 }
 
-func oneOffProgress(ctx context.Context, id string) func(err error) error {
-	pw, _, _ := progress.FromContext(ctx)
-	now := time.Now()
-	st := progress.Status{
-		Started: &now,
+func (e *imageExporterInstance) defaultOCITypes(compatibilityVersion int, src *exporter.Source) bool {
+	if e.opt.Variant == VariantOCI {
+		return true
 	}
-	pw.Write(id, st)
-	return func(err error) error {
-		// TODO: set error on status
-		now := time.Now()
-		st.Completed = &now
-		pw.Write(id, st)
-		pw.Close()
-		return err
-	}
+	return containerimage.DefaultOCITypes(compatibilityVersion, src)
 }
 
 func normalizedNames(name string) ([]string, error) {
@@ -250,7 +311,7 @@ func normalizedNames(name string) ([]string, error) {
 		return nil, nil
 	}
 	names := strings.Split(name, ",")
-	var tagNames = make([]string, len(names))
+	tagNames := make([]string, len(names))
 	for i, name := range names {
 		parsed, err := reference.ParseNormalizedNamed(name)
 		if err != nil {

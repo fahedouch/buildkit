@@ -4,15 +4,15 @@ BuildKit is a concurrent, cache-efficient, and Dockerfile-agnostic builder toolk
 
 Report issues at https://github.com/moby/buildkit
 
-Join `#buildkit` channel on [Docker Community Slack](http://dockr.ly/slack)
+Join `#buildkit` channel on [Docker Community Slack](https://dockr.ly/comm-slack)
 
 # Tags
 
 ### Latest stable release
 
-- [`v0.8.1`, `latest`](https://github.com/moby/buildkit/blob/v0.8.1/Dockerfile)
+- [`v0.10.0`, `latest`](https://github.com/moby/buildkit/blob/v0.10.0/Dockerfile)
 
-- [`v0.8.1-rootless`, `rootless`](https://github.com/moby/buildkit/blob/v0.8.1/Dockerfile) (see [`docs/rootless.md`](https://github.com/moby/buildkit/blob/master/docs/rootless.md) for usage)
+- [`v0.10.0-rootless`, `rootless`](https://github.com/moby/buildkit/blob/v0.10.0/Dockerfile) (see [`docs/rootless.md`](https://github.com/moby/buildkit/blob/master/docs/rootless.md) for usage)
 
 ### Development build from master branch
 
@@ -82,7 +82,7 @@ docker run \
     --rm \
     --security-opt seccomp=unconfined \
     --security-opt apparmor=unconfined \
-    -e BUILDKITD_FLAGS=--oci-worker-no-process-sandbox \
+    --security-opt systempaths=unconfined \
     -v /path/to/dir:/tmp/work \
     --entrypoint buildctl-daemonless.sh \
     moby/buildkit:master-rootless \

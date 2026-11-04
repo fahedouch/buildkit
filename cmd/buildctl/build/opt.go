@@ -1,27 +1,37 @@
 package build
 
 import (
-	"github.com/sirupsen/logrus"
+	"maps"
+	"os"
+	"strings"
 )
 
-func ParseOpt(opts, legacyFrontendOpts []string) (map[string]string, error) {
-	m := make(map[string]string)
-	if len(legacyFrontendOpts) > 0 {
-		logrus.Warn("--frontend-opt <opt>=<optval> is deprecated. Please use --opt <opt>=<optval> instead.")
-		legacy, err := attrMap(legacyFrontendOpts)
-		if err != nil {
-			return nil, err
+const buildArgPrefix = "build-arg:"
+
+func ParseOpt(opts []string) (map[string]string, error) {
+	m := loadOptEnv()
+
+	// A build arg given without a value, e.g. "build-arg:FOO", takes its value
+	// from the client environment, matching "docker build --build-arg FOO".
+	// Variables that are not set in the environment are left out entirely, so
+	// the default from the Dockerfile still applies. Resolved args keep their
+	// position in the list so that the last of two duplicates still wins.
+	resolved := make([]string, 0, len(opts))
+	for _, opt := range opts {
+		if name, ok := strings.CutPrefix(opt, buildArgPrefix); ok && name != "" && !strings.Contains(name, "=") {
+			v, ok := os.LookupEnv(name)
+			if !ok {
+				continue
+			}
+			opt += "=" + v
 		}
-		for k, v := range legacy {
-			m[k] = v
-		}
+		resolved = append(resolved, opt)
 	}
-	modern, err := attrMap(opts)
+
+	m2, err := attrMap(resolved)
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range modern {
-		m[k] = v
-	}
+	maps.Copy(m, m2)
 	return m, nil
 }

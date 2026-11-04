@@ -16,7 +16,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"strings"
 
@@ -38,12 +38,12 @@ func xmain() error {
 		return errors.New("should not reach here")
 	}
 	key := os.Args[1]
-	stdin, err := ioutil.ReadAll(os.Stdin)
+	stdin, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return err
 	}
 	var nodes []string
-	for _, s := range strings.Split(string(stdin), "\n") {
+	for s := range strings.SplitSeq(string(stdin), "\n") {
 		s = strings.TrimSpace(s)
 		if s != "" {
 			nodes = append(nodes, s)

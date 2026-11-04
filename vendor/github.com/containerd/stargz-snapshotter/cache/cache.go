@@ -18,14 +18,16 @@ package cache
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
 
-	"github.com/golang/groupcache/lru"
-	"github.com/pkg/errors"
+	"github.com/containerd/stargz-snapshotter/util/cacheutil"
+	"github.com/containerd/stargz-snapshotter/util/namedmutex"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -34,28 +36,81 @@ const (
 )
 
 type DirectoryCacheConfig struct {
+
+	// Number of entries of LRU cache (default: 10).
+	// This won't be used when DataCache is specified.
 	MaxLRUCacheEntry int
-	MaxCacheFds      int
-	SyncAdd          bool
+
+	// Number of file descriptors to cache (default: 10).
+	// This won't be used when FdCache is specified.
+	MaxCacheFds int
+
+	// On Add, wait until the data is fully written to the cache directory.
+	SyncAdd bool
+
+	// DataCache is an on-memory cache of the data.
+	// OnEvicted will be overridden and replaced for internal use.
+	DataCache *cacheutil.LRUCache
+
+	// FdCache is a cache for opened file descriptors.
+	// OnEvicted will be overridden and replaced for internal use.
+	FdCache *cacheutil.LRUCache
+
+	// BufPool will be used for pooling bytes.Buffer.
+	BufPool *sync.Pool
+
+	// Direct forcefully enables direct mode for all operation in cache.
+	// Thus operation won't use on-memory caches.
+	Direct bool
+
+	// FadvDontNeed forcefully clean fscache pagecache for saving memory.
+	FadvDontNeed bool
 }
 
 // TODO: contents validation.
 
+// BlobCache represents a cache for bytes data
 type BlobCache interface {
-	Add(key string, p []byte, opts ...Option)
-	FetchAt(key string, offset int64, p []byte, opts ...Option) (n int, err error)
+	// Add returns a writer to add contents to cache
+	Add(key string, opts ...Option) (Writer, error)
+
+	// Get returns a reader to read the specified contents
+	// from cache
+	Get(key string, opts ...Option) (Reader, error)
+
+	// Close closes the cache
+	Close() error
+}
+
+// Reader provides the data cached.
+type Reader interface {
+	io.ReaderAt
+	Close() error
+
+	// If a blob is backed by a file, it should return *os.File so that it can be used for FUSE passthrough
+	GetReaderAt() io.ReaderAt
+}
+
+// Writer enables the client to cache byte data. Commit() must be
+// called after data is fully written to Write(). To abort the written
+// data, Abort() must be called.
+type Writer interface {
+	io.WriteCloser
+	Commit() error
+	Abort() error
 }
 
 type cacheOpt struct {
-	direct bool
+	direct      bool
+	passThrough bool
 }
 
 type Option func(o *cacheOpt) *cacheOpt
 
-// When Direct option is specified for FetchAt and Add methods, these operation
-// won't use on-memory caches. When you know that the targeting value won't be
-// used immediately, you can prevent the limited space of on-memory caches from
-// being polluted by these unimportant values.
+// Direct option lets FetchAt and Add methods not to use on-memory caches. When
+// you know that the targeting value won't be  used immediately, you can prevent
+// the limited space of on-memory caches from being polluted by these unimportant
+// values.
 func Direct() Option {
 	return func(o *cacheOpt) *cacheOpt {
 		o.direct = true
@@ -63,34 +118,66 @@ func Direct() Option {
 	}
 }
 
+// PassThrough option indicates whether to enable FUSE passthrough mode
+// to improve local file read performance.
+func PassThrough() Option {
+	return func(o *cacheOpt) *cacheOpt {
+		o.passThrough = true
+		return o
+	}
+}
+
 func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache, error) {
-	maxEntry := config.MaxLRUCacheEntry
-	if maxEntry == 0 {
-		maxEntry = defaultMaxLRUCacheEntry
+	if !filepath.IsAbs(directory) {
+		return nil, fmt.Errorf("dir cache path must be an absolute path; got %q", directory)
 	}
-	maxFds := config.MaxCacheFds
-	if maxFds == 0 {
-		maxFds = defaultMaxCacheFds
+	bufPool := config.BufPool
+	if bufPool == nil {
+		bufPool = &sync.Pool{
+			New: func() any {
+				return new(bytes.Buffer)
+			},
+		}
 	}
-	if err := os.MkdirAll(directory, os.ModePerm); err != nil {
+	dataCache := config.DataCache
+	if dataCache == nil {
+		maxEntry := config.MaxLRUCacheEntry
+		if maxEntry == 0 {
+			maxEntry = defaultMaxLRUCacheEntry
+		}
+		dataCache = cacheutil.NewLRUCache(maxEntry)
+		dataCache.OnEvicted = func(key string, value any) {
+			value.(*bytes.Buffer).Reset()
+			bufPool.Put(value)
+		}
+	}
+	fdCache := config.FdCache
+	if fdCache == nil {
+		maxEntry := config.MaxCacheFds
+		if maxEntry == 0 {
+			maxEntry = defaultMaxCacheFds
+		}
+		fdCache = cacheutil.NewLRUCache(maxEntry)
+		fdCache.OnEvicted = func(key string, value any) {
+			value.(*os.File).Close()
+		}
+	}
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return nil, err
+	}
+	wipdir := filepath.Join(directory, "wip")
+	if err := os.MkdirAll(wipdir, 0700); err != nil {
 		return nil, err
 	}
 	dc := &directoryCache{
-		cache:     newObjectCache(maxEntry),
-		fileCache: newObjectCache(maxFds),
-		wipLock:   &namedLock{},
-		directory: directory,
-		bufPool: sync.Pool{
-			New: func() interface{} {
-				return new(bytes.Buffer)
-			},
-		},
-	}
-	dc.cache.finalize = func(value interface{}) {
-		dc.bufPool.Put(value)
-	}
-	dc.fileCache.finalize = func(value interface{}) {
-		value.(*os.File).Close()
+		cache:        dataCache,
+		fileCache:    fdCache,
+		wipLock:      new(namedmutex.NamedMutex),
+		directory:    directory,
+		wipDirectory: wipdir,
+		bufPool:      bufPool,
+		direct:       config.Direct,
+		fadvDontNeed: config.FadvDontNeed,
 	}
 	dc.syncAdd = config.SyncAdd
 	return dc, nil
@@ -98,38 +185,53 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 
 // directoryCache is a cache implementation which backend is a directory.
 type directoryCache struct {
-	cache     *objectCache
-	fileCache *objectCache
-	directory string
-	wipLock   *namedLock
+	cache        *cacheutil.LRUCache
+	fileCache    *cacheutil.LRUCache
+	wipDirectory string
+	directory    string
+	wipLock      *namedmutex.NamedMutex
 
-	bufPool sync.Pool
+	bufPool *sync.Pool
 
-	syncAdd bool
+	syncAdd      bool
+	direct       bool
+	fadvDontNeed bool
+
+	closed   bool
+	closedMu sync.Mutex
 }
 
-func (dc *directoryCache) FetchAt(key string, offset int64, p []byte, opts ...Option) (n int, err error) {
+func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
+	if dc.isClosed() {
+		return nil, fmt.Errorf("cache is already closed")
+	}
+
 	opt := &cacheOpt{}
 	for _, o := range opts {
 		opt = o(opt)
 	}
 
-	if !opt.direct {
+	if !dc.direct && !opt.direct {
 		// Get data from memory
-		if b, done, ok := dc.cache.get(key); ok {
-			defer done()
-			data := b.(*bytes.Buffer).Bytes()
-			if int64(len(data)) < offset {
-				return 0, fmt.Errorf("invalid offset %d exceeds chunk size %d",
-					offset, len(data))
-			}
-			return copy(p, data[offset:]), nil
+		if b, done, ok := dc.cache.Get(key); ok {
+			return &reader{
+				ReaderAt: bytes.NewReader(b.(*bytes.Buffer).Bytes()),
+				closeFunc: func() error {
+					done()
+					return nil
+				},
+			}, nil
 		}
 
 		// Get data from disk. If the file is already opened, use it.
-		if f, done, ok := dc.fileCache.get(key); ok {
-			defer done()
-			return f.(*os.File).ReadAt(p, offset)
+		if f, done, ok := dc.fileCache.Get(key); ok {
+			return &reader{
+				ReaderAt: f.(*os.File),
+				closeFunc: func() error {
+					done() // file will be closed when it's evicted from the cache
+					return nil
+				},
+			}, nil
 		}
 	}
 
@@ -138,257 +240,252 @@ func (dc *directoryCache) FetchAt(key string, offset int64, p []byte, opts ...Op
 	//       or simply report the cache miss?
 	file, err := os.Open(dc.cachePath(key))
 	if err != nil {
-		return 0, errors.Wrapf(err, "failed to open blob file for %q", key)
-	}
-	if n, err = file.ReadAt(p, offset); err == io.EOF {
-		err = nil
+		return nil, fmt.Errorf("failed to open blob file for %q: %w", key, err)
 	}
 
-	// Cache the opened file for future use. If "direct" option is specified, this
-	// won't be done. This option is useful for preventing file cache from being
-	// polluted by data that won't be accessed immediately.
-	if opt.direct || !dc.fileCache.add(key, file) {
-		file.Close()
+	// If "direct" option is specified, do not cache the file on memory.
+	// This option is useful for preventing memory cache from being polluted by data
+	// that won't be accessed immediately.
+	if dc.direct || opt.direct {
+		return &reader{
+			ReaderAt: file,
+			closeFunc: func() error {
+				if dc.fadvDontNeed {
+					if err := dropFilePageCache(file); err != nil {
+						fmt.Printf("Warning: failed to drop page cache: %v\n", err)
+					}
+				}
+
+				return file.Close()
+			},
+		}, nil
 	}
 
 	// TODO: should we cache the entire file data on memory?
 	//       but making I/O (possibly huge) on every fetching
 	//       might be costly.
-
-	return n, err
+	return &reader{
+		ReaderAt: file,
+		closeFunc: func() error {
+			_, done, added := dc.fileCache.Add(key, file)
+			defer done() // Release it immediately. Cleaned up on eviction.
+			if !added {
+				return file.Close() // file already exists in the cache. close it.
+			}
+			return nil
+		},
+	}, nil
 }
 
-func (dc *directoryCache) Add(key string, p []byte, opts ...Option) {
+func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
+	if dc.isClosed() {
+		return nil, fmt.Errorf("cache is already closed")
+	}
+
 	opt := &cacheOpt{}
 	for _, o := range opts {
 		opt = o(opt)
 	}
 
-	if !opt.direct {
-		// Cache the passed data on memory. This enables to serve this data even
-		// during writing it to the disk. If "direct" option is specified, this
-		// won't be done. This option is useful for preventing memory cache from being
-		// polluted by data that won't be accessed immediately.
-		b := dc.bufPool.Get().(*bytes.Buffer)
-		b.Reset()
-		b.Write(p)
-		if !dc.cache.add(key, b) {
-			dc.bufPool.Put(b) // Already exists. No need to cache.
-		}
+	wip, err := dc.wipFile(key)
+	if err != nil {
+		return nil, err
+	}
+	w := &writer{
+		WriteCloser: wip,
+		commitFunc: func() error {
+			if dc.isClosed() {
+				return fmt.Errorf("cache is already closed")
+			}
+			// Commit the cache contents
+			c := dc.cachePath(key)
+			if err := os.MkdirAll(filepath.Dir(c), os.ModePerm); err != nil {
+				var errs []error
+				if err := os.Remove(wip.Name()); err != nil {
+					errs = append(errs, err)
+				}
+				errs = append(errs, fmt.Errorf("failed to create cache directory %q: %w", c, err))
+				return errors.Join(errs...)
+			}
+
+			if dc.fadvDontNeed {
+				if err := dropFilePageCache(wip); err != nil {
+					fmt.Printf("Warning: failed to drop page cache: %v\n", err)
+				}
+			}
+
+			return os.Rename(wip.Name(), c)
+		},
+		abortFunc: func() error {
+			return os.Remove(wip.Name())
+		},
 	}
 
-	// Cache the passed data to disk.
-	b2 := dc.bufPool.Get().(*bytes.Buffer)
-	b2.Reset()
-	b2.Write(p)
-	addFunc := func() {
-		defer dc.bufPool.Put(b2)
-
-		var (
-			c   = dc.cachePath(key)
-			wip = dc.wipPath(key)
-		)
-
-		dc.wipLock.lock(key)
-		if _, err := os.Stat(wip); err == nil {
-			dc.wipLock.unlock(key)
-			return // Write in progress
-		}
-		if _, err := os.Stat(c); err == nil {
-			dc.wipLock.unlock(key)
-			return // Already exists.
-		}
-
-		// Write the contents to a temporary file
-		if err := os.MkdirAll(filepath.Dir(wip), os.ModePerm); err != nil {
-			fmt.Printf("Warning: Failed to Create blob cache directory %q: %v\n", c, err)
-			dc.wipLock.unlock(key)
-			return
-		}
-		wipfile, err := os.Create(wip)
-		if err != nil {
-			fmt.Printf("Warning: failed to prepare temp file for storing cache %q", key)
-			dc.wipLock.unlock(key)
-			return
-		}
-		dc.wipLock.unlock(key)
-
-		defer func() {
-			wipfile.Close()
-			os.Remove(wipfile.Name())
-		}()
-		want := b2.Len()
-		if _, err := io.CopyN(wipfile, b2, int64(want)); err != nil {
-			fmt.Printf("Warning: failed to write cache: %v\n", err)
-			return
-		}
-
-		// Commit the cache contents
-		if err := os.MkdirAll(filepath.Dir(c), os.ModePerm); err != nil {
-			fmt.Printf("Warning: Failed to Create blob cache directory %q: %v\n", c, err)
-			return
-		}
-		if err := os.Rename(wipfile.Name(), c); err != nil {
-			fmt.Printf("Warning: failed to commit cache to %q: %v\n", c, err)
-			return
-		}
-		file, err := os.Open(c)
-		if err != nil {
-			fmt.Printf("Warning: failed to open cache on %q: %v\n", c, err)
-			return
-		}
-
-		// Cache the opened file for future use. If "direct" option is specified, this
-		// won't be done. This option is useful for preventing file cache from being
-		// polluted by data that won't be accessed immediately.
-		if opt.direct || !dc.fileCache.add(key, file) {
-			file.Close()
-		}
+	// If "direct" option is specified, do not cache the passed data on memory.
+	// This option is useful for preventing memory cache from being polluted by data
+	// that won't be accessed immediately.
+	if dc.direct || opt.direct {
+		return w, nil
 	}
 
-	if dc.syncAdd {
-		addFunc()
-	} else {
-		go addFunc()
+	b := dc.bufPool.Get().(*bytes.Buffer)
+	memW := &writer{
+		WriteCloser: nopWriteCloser(io.Writer(b)),
+		commitFunc: func() error {
+			if dc.isClosed() {
+				w.Close()
+				return fmt.Errorf("cache is already closed")
+			}
+			cached, done, added := dc.cache.Add(key, b)
+			if !added {
+				dc.putBuffer(b) // already exists in the cache. abort it.
+			}
+			commit := func() error {
+				defer done()
+				defer w.Close()
+				n, err := w.Write(cached.(*bytes.Buffer).Bytes())
+				if err != nil || n != cached.(*bytes.Buffer).Len() {
+					w.Abort()
+					return err
+				}
+				return w.Commit()
+			}
+			if dc.syncAdd {
+				return commit()
+			}
+			go func() {
+				if err := commit(); err != nil {
+					fmt.Println("failed to commit to file:", err)
+				}
+			}()
+			return nil
+		},
+		abortFunc: func() error {
+			defer w.Close()
+			defer w.Abort()
+			dc.putBuffer(b) // abort it.
+			return nil
+		},
 	}
+
+	return memW, nil
+}
+
+func (dc *directoryCache) putBuffer(b *bytes.Buffer) {
+	b.Reset()
+	dc.bufPool.Put(b)
+}
+
+func (dc *directoryCache) Close() error {
+	dc.closedMu.Lock()
+	defer dc.closedMu.Unlock()
+	if dc.closed {
+		return nil
+	}
+	dc.closed = true
+	return os.RemoveAll(dc.directory)
+}
+
+func (dc *directoryCache) isClosed() bool {
+	dc.closedMu.Lock()
+	closed := dc.closed
+	dc.closedMu.Unlock()
+	return closed
 }
 
 func (dc *directoryCache) cachePath(key string) string {
 	return filepath.Join(dc.directory, key[:2], key)
 }
 
-func (dc *directoryCache) wipPath(key string) string {
-	return filepath.Join(dc.directory, key[:2], "w", key)
-}
-
-type namedLock struct {
-	muMap  map[string]*sync.Mutex
-	refMap map[string]int
-
-	mu sync.Mutex
-}
-
-func (nl *namedLock) lock(name string) {
-	nl.mu.Lock()
-	if nl.muMap == nil {
-		nl.muMap = make(map[string]*sync.Mutex)
-	}
-	if nl.refMap == nil {
-		nl.refMap = make(map[string]int)
-	}
-	if _, ok := nl.muMap[name]; !ok {
-		nl.muMap[name] = &sync.Mutex{}
-	}
-	mu := nl.muMap[name]
-	nl.refMap[name]++
-	nl.mu.Unlock()
-	mu.Lock()
-}
-
-func (nl *namedLock) unlock(name string) {
-	nl.mu.Lock()
-	mu := nl.muMap[name]
-	nl.refMap[name]--
-	if nl.refMap[name] <= 0 {
-		delete(nl.muMap, name)
-		delete(nl.refMap, name)
-	}
-	nl.mu.Unlock()
-	mu.Unlock()
-}
-
-func newObjectCache(maxEntries int) *objectCache {
-	oc := &objectCache{
-		cache: lru.New(maxEntries),
-	}
-	oc.cache.OnEvicted = func(key lru.Key, value interface{}) {
-		value.(*object).release() // Decrease ref count incremented in add operation.
-	}
-	return oc
-}
-
-type objectCache struct {
-	cache    *lru.Cache
-	cacheMu  sync.Mutex
-	finalize func(interface{})
-}
-
-func (oc *objectCache) get(key string) (value interface{}, done func(), ok bool) {
-	oc.cacheMu.Lock()
-	defer oc.cacheMu.Unlock()
-	o, ok := oc.cache.Get(key)
-	if !ok {
-		return nil, nil, false
-	}
-	o.(*object).use()
-	return o.(*object).v, func() { o.(*object).release() }, true
-}
-
-func (oc *objectCache) add(key string, value interface{}) bool {
-	oc.cacheMu.Lock()
-	defer oc.cacheMu.Unlock()
-	if _, ok := oc.cache.Get(key); ok {
-		return false // TODO: should we swap the object?
-	}
-	o := &object{
-		v:        value,
-		finalize: oc.finalize,
-	}
-	o.use() // Keep this object having at least 1 ref count (will be decreased on eviction)
-	oc.cache.Add(key, o)
-	return true
-}
-
-type object struct {
-	v interface{}
-
-	refCounts int64
-	finalize  func(interface{})
-
-	mu sync.Mutex
-}
-
-func (o *object) use() {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.refCounts++
-}
-
-func (o *object) release() {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.refCounts--
-	if o.refCounts <= 0 && o.finalize != nil {
-		// nobody will refer this object
-		o.finalize(o.v)
-	}
+func (dc *directoryCache) wipFile(key string) (*os.File, error) {
+	return os.CreateTemp(dc.wipDirectory, key+"-*")
 }
 
 func NewMemoryCache() BlobCache {
-	return &memoryCache{
-		membuf: map[string]string{},
+	return &MemoryCache{
+		Membuf: map[string]*bytes.Buffer{},
 	}
 }
 
-// memoryCache is a cache implementation which backend is a memory.
-type memoryCache struct {
-	membuf map[string]string // read-only []byte map is more ideal but we don't have it in golang...
+// MemoryCache is a cache implementation which backend is a memory.
+type MemoryCache struct {
+	Membuf map[string]*bytes.Buffer
 	mu     sync.Mutex
 }
 
-func (mc *memoryCache) FetchAt(key string, offset int64, p []byte, opts ...Option) (n int, err error) {
+func (mc *MemoryCache) Get(key string, opts ...Option) (Reader, error) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
-
-	cache, ok := mc.membuf[key]
+	b, ok := mc.Membuf[key]
 	if !ok {
-		return 0, fmt.Errorf("Missed cache: %q", key)
+		return nil, fmt.Errorf("missed cache: %q", key)
 	}
-	return copy(p, cache[offset:]), nil
+	return &reader{bytes.NewReader(b.Bytes()), func() error { return nil }}, nil
 }
 
-func (mc *memoryCache) Add(key string, p []byte, opts ...Option) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	mc.membuf[key] = string(p)
+func (mc *MemoryCache) Add(key string, opts ...Option) (Writer, error) {
+	b := new(bytes.Buffer)
+	return &writer{
+		WriteCloser: nopWriteCloser(io.Writer(b)),
+		commitFunc: func() error {
+			mc.mu.Lock()
+			defer mc.mu.Unlock()
+			mc.Membuf[key] = b
+			return nil
+		},
+		abortFunc: func() error { return nil },
+	}, nil
+}
+
+func (mc *MemoryCache) Close() error {
+	return nil
+}
+
+type reader struct {
+	io.ReaderAt
+	closeFunc func() error
+}
+
+func (r *reader) Close() error { return r.closeFunc() }
+
+func (r *reader) GetReaderAt() io.ReaderAt {
+	return r.ReaderAt
+}
+
+type writer struct {
+	io.WriteCloser
+	commitFunc func() error
+	abortFunc  func() error
+}
+
+func (w *writer) Commit() error {
+	return w.commitFunc()
+}
+
+func (w *writer) Abort() error {
+	return w.abortFunc()
+}
+
+type writeCloser struct {
+	io.Writer
+	closeFunc func() error
+}
+
+func (w *writeCloser) Close() error { return w.closeFunc() }
+
+func nopWriteCloser(w io.Writer) io.WriteCloser {
+	return &writeCloser{w, func() error { return nil }}
+}
+
+func dropFilePageCache(file *os.File) error {
+	if file == nil {
+		return nil
+	}
+
+	fd := file.Fd()
+	err := unix.Fadvise(int(fd), 0, 0, unix.FADV_DONTNEED)
+	if err != nil {
+		return fmt.Errorf("posix_fadvise failed, ret=%d", err)
+	}
+	return nil
 }

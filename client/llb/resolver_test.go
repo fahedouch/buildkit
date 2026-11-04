@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/containerd/platforms"
+	"github.com/moby/buildkit/client/llb/sourceresolver"
 	"github.com/moby/buildkit/solver/pb"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -21,10 +23,11 @@ func TestImageMetaResolver(t *testing.T) {
 
 	require.Equal(t, false, tr.called)
 
-	def, err := st.Marshal(context.TODO())
+	def, err := st.Marshal(t.Context(), LinuxPpc64le)
 	require.NoError(t, err)
 
 	require.Equal(t, true, tr.called)
+	require.Equal(t, "linux/ppc64le", tr.platform)
 
 	m, arr := parseDef(t, def.Def)
 	require.Equal(t, 2, len(arr))
@@ -35,7 +38,7 @@ func TestImageMetaResolver(t *testing.T) {
 
 	require.Equal(t, "docker-image://docker.io/library/alpine:latest", arr[0].Op.(*pb.Op_Source).Source.GetIdentifier())
 
-	d, err := st.GetDir(context.TODO())
+	d, err := st.GetDir(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, "/bar", d)
 }
@@ -48,7 +51,7 @@ func TestImageResolveDigest(t *testing.T) {
 		dir:    "/foo",
 	}), ResolveDigest(true))
 
-	def, err := st.Marshal(context.TODO())
+	def, err := st.Marshal(t.Context())
 	require.NoError(t, err)
 
 	m, arr := parseDef(t, def.Def)
@@ -60,32 +63,37 @@ func TestImageResolveDigest(t *testing.T) {
 
 	require.Equal(t, "docker-image://docker.io/library/alpine:latest@"+string(digest.FromBytes([]byte("bar"))), arr[0].Op.(*pb.Op_Source).Source.GetIdentifier())
 
-	d, err := st.GetDir(context.TODO())
+	d, err := st.GetDir(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, "/foo", d)
 }
 
 type testResolver struct {
-	digest digest.Digest
-	dir    string
-	called bool
+	digest   digest.Digest
+	dir      string
+	called   bool
+	platform string
 }
 
-func (r *testResolver) ResolveImageConfig(ctx context.Context, ref string, opt ResolveImageConfigOpt) (digest.Digest, []byte, error) {
+func (r *testResolver) ResolveImageConfig(ctx context.Context, ref string, opt sourceresolver.Opt) (string, digest.Digest, []byte, error) {
 	var img struct {
 		Config struct {
 			Env        []string `json:"Env,omitempty"`
 			WorkingDir string   `json:"WorkingDir,omitempty"`
 			User       string   `json:"User,omitempty"`
-		} `json:"config,omitempty"`
+		} `json:"config"`
 	}
 	r.called = true
 
 	img.Config.WorkingDir = r.dir
 
+	if imgOpt := opt.ImageOpt; imgOpt != nil && imgOpt.Platform != nil {
+		r.platform = platforms.Format(*imgOpt.Platform)
+	}
+
 	dt, err := json.Marshal(img)
 	if err != nil {
-		return "", nil, errors.WithStack(err)
+		return "", "", nil, errors.WithStack(err)
 	}
-	return r.digest, dt, nil
+	return ref, r.digest, dt, nil
 }

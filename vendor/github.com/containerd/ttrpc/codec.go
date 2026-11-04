@@ -17,26 +17,27 @@
 package ttrpc
 
 import (
-	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
+	"fmt"
+
+	"google.golang.org/protobuf/proto"
 )
 
 type codec struct{}
 
-func (c codec) Marshal(msg interface{}) ([]byte, error) {
+func (c codec) Marshal(msg any) ([]byte, error) {
 	switch v := msg.(type) {
 	case proto.Message:
 		return proto.Marshal(v)
 	default:
-		return nil, errors.Errorf("ttrpc: cannot marshal unknown type: %T", msg)
+		return nil, fmt.Errorf("ttrpc: cannot marshal unknown type: %T", msg)
 	}
 }
 
-func (c codec) Unmarshal(p []byte, msg interface{}) error {
+func (c codec) Unmarshal(p []byte, msg any) error {
 	switch v := msg.(type) {
 	case proto.Message:
 		return proto.Unmarshal(p, v)
 	default:
-		return errors.Errorf("ttrpc: cannot unmarshal into unknown type: %T", msg)
+		return fmt.Errorf("ttrpc: cannot unmarshal into unknown type: %T", msg)
 	}
 }

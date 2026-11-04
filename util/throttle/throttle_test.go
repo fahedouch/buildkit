@@ -11,9 +11,9 @@ import (
 func TestThrottle(t *testing.T) {
 	t.Parallel()
 
-	var i int64
+	var i atomic.Int64
 	f := func() {
-		atomic.AddInt64(&i, 1)
+		i.Add(1)
 	}
 
 	f = Throttle(50*time.Millisecond, f)
@@ -21,46 +21,43 @@ func TestThrottle(t *testing.T) {
 	f()
 	f()
 
-	require.Equal(t, int64(0), atomic.LoadInt64(&i))
+	require.Equal(t, int64(0), i.Load())
 
 	// test that i is never incremented twice and at least once in next 600ms
 	retries := 0
 	for {
-		require.True(t, retries < 10)
+		require.Less(t, retries, 10)
 		time.Sleep(60 * time.Millisecond)
-		v := atomic.LoadInt64(&i)
-		if v > 1 {
-			require.Fail(t, "invalid value %d", v)
-		}
+		v := i.Load()
+		require.LessOrEqual(t, v, int64(1))
 		if v == 1 {
 			break
 		}
 		retries++
 	}
 
-	require.Equal(t, int64(1), atomic.LoadInt64(&i))
+	require.Equal(t, int64(1), i.Load())
 
 	f()
 
 	retries = 0
 	for {
-		require.True(t, retries < 10)
+		require.Less(t, retries, 10)
 		time.Sleep(60 * time.Millisecond)
-		v := atomic.LoadInt64(&i)
+		v := i.Load()
 		if v == 2 {
 			break
 		}
 		retries++
 	}
-
 }
 
 func TestAfter(t *testing.T) {
 	t.Parallel()
 
-	var i int64
+	var i atomic.Int64
 	f := func() {
-		atomic.AddInt64(&i, 1)
+		i.Add(1)
 	}
 
 	f = After(100*time.Millisecond, f)
@@ -68,11 +65,11 @@ func TestAfter(t *testing.T) {
 	f()
 
 	time.Sleep(10 * time.Millisecond)
-	require.Equal(t, int64(1), atomic.LoadInt64(&i))
+	require.Equal(t, int64(1), i.Load())
 	f()
 	time.Sleep(10 * time.Millisecond)
-	require.Equal(t, int64(1), atomic.LoadInt64(&i))
+	require.Equal(t, int64(1), i.Load())
 
 	time.Sleep(200 * time.Millisecond)
-	require.Equal(t, int64(2), atomic.LoadInt64(&i))
+	require.Equal(t, int64(2), i.Load())
 }

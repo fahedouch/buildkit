@@ -3,12 +3,14 @@ package llb
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
-	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/solver/pb"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestDefinitionEquivalence(t *testing.T) {
@@ -26,31 +28,30 @@ func TestDefinitionEquivalence(t *testing.T) {
 		{"platform constraint", Image("ref", LinuxArm64)},
 		{"mount", Image("busybox").Run(Shlex(`sh -c "echo foo > /out/foo"`)).AddMount("/out", Scratch())},
 	} {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			ctx := context.TODO()
+			ctx := t.Context()
 
-			def, err := tc.state.Marshal(context.TODO())
+			def, err := tc.state.Marshal(ctx)
 			require.NoError(t, err)
 
 			op, err := NewDefinitionOp(def.ToPB())
 			require.NoError(t, err)
 
-			err = op.Validate(ctx)
+			err = op.Validate(ctx, nil)
 			require.NoError(t, err)
 
 			st2 := NewState(op.Output())
 
-			def2, err := st2.Marshal(context.TODO())
+			def2, err := st2.Marshal(ctx)
 			require.NoError(t, err)
 			require.Equal(t, len(def.Def), len(def2.Def))
 			require.Equal(t, len(def.Metadata), len(def2.Metadata))
 
-			for i := 0; i < len(def.Def); i++ {
+			for i := range def.Def {
 				res := bytes.Compare(def.Def[i], def2.Def[i])
-				require.Equal(t, res, 0)
+				require.Equal(t, 0, res)
 			}
 
 			for dgst := range def.Metadata {
@@ -93,28 +94,109 @@ func TestDefinitionInputCache(t *testing.T) {
 		AddMount("/b2", stB.GetMount("/mnt")),
 	).Root()
 
-	ctx := context.TODO()
+	ctx := t.Context()
 
-	def, err := st.Marshal(context.TODO())
+	def, err := st.Marshal(ctx)
 	require.NoError(t, err)
 
 	op, err := NewDefinitionOp(def.ToPB())
 	require.NoError(t, err)
 
-	err = op.Validate(ctx)
+	err = op.Validate(ctx, nil)
 	require.NoError(t, err)
 
 	st2 := NewState(op.Output())
 	marshalDef := &Definition{
-		Metadata: make(map[digest.Digest]pb.OpMetadata, 0),
+		Metadata: make(map[digest.Digest]OpMetadata, 0),
 	}
 	constraints := &Constraints{}
 	smc := newSourceMapCollector()
 
 	// verify the expected number of vertexes gets marshalled
 	vertexCache := make(map[Vertex]struct{})
-	_, err = marshal(ctx, st2.Output().Vertex(ctx), marshalDef, smc, map[digest.Digest]struct{}{}, vertexCache, constraints)
+	_, err = marshal(ctx, st2.Output().Vertex(ctx, constraints), marshalDef, smc, map[digest.Digest]struct{}{}, vertexCache, constraints)
 	require.NoError(t, err)
 	// 1 exec + 2x2 mounts from stA and stB + 1 src = 6 vertexes
 	require.Equal(t, 6, len(vertexCache))
+
+	// make sure that walking vertices in parallel doesn't cause panic
+	var all []RunOption
+	for i := range 100 {
+		var sts []RunOption
+		for j := range 100 {
+			sts = append(sts, AddMount("/mnt", Scratch().Run(Shlex(fmt.Sprintf("%d-%d", i, j))).Root()))
+		}
+		all = append(all, AddMount("/mnt", Scratch().Run(append([]RunOption{Shlex("args")}, sts...)...).Root()))
+	}
+	def, err = Scratch().Run(append([]RunOption{Shlex("args")}, all...)...).Root().Marshal(ctx)
+	require.NoError(t, err)
+	op, err = NewDefinitionOp(def.ToPB())
+	require.NoError(t, err)
+	require.NoError(t, testParallelWalk(ctx, op.Output()))
+}
+
+func TestDefinitionNil(t *testing.T) {
+	// should be an error, not a panic
+	_, err := NewDefinitionOp(nil)
+	require.Error(t, err)
+}
+
+func TestDefinitionInvalidSourceLocations(t *testing.T) {
+	def, err := Image("ref").Marshal(t.Context())
+	require.NoError(t, err)
+	pbDef := def.ToPB()
+	dgst := digest.FromBytes(pbDef.Def[0])
+
+	for _, tc := range []struct {
+		name    string
+		locs    *pb.Locations
+		wantErr string
+	}{
+		{
+			name:    "nil locations",
+			wantErr: fmt.Sprintf("invalid nil source locations for vertex %s", dgst),
+		},
+		{
+			name:    "nil location",
+			locs:    &pb.Locations{Locations: []*pb.Location{nil}},
+			wantErr: fmt.Sprintf("invalid nil source location for vertex %s", dgst),
+		},
+		{
+			name:    "invalid source index",
+			locs:    &pb.Locations{Locations: []*pb.Location{{SourceIndex: 1}}},
+			wantErr: "failed to find source map with index 1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pbDef.Source = &pb.Source{
+				Infos:     []*pb.SourceInfo{{Filename: "Dockerfile"}},
+				Locations: map[string]*pb.Locations{string(dgst): tc.locs},
+			}
+
+			// should be an error, not a panic
+			_, err := NewDefinitionOp(pbDef)
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestDefinitionNoInputsOnLastVertex(t *testing.T) {
+	def, err := Image("ref").Marshal(t.Context())
+	require.NoError(t, err)
+	pbDef := def.ToPB()
+	pbDef.Def = pbDef.Def[:1] // drop the terminal vertex
+
+	// should be an error, not a panic
+	_, err = NewDefinitionOp(pbDef)
+	require.ErrorContains(t, err, "invalid definition with no inputs on last vertex")
+}
+
+func testParallelWalk(ctx context.Context, out Output) error {
+	eg, egCtx := errgroup.WithContext(ctx)
+	for _, o := range out.Vertex(ctx, nil).Inputs() {
+		eg.Go(func() error {
+			return testParallelWalk(egCtx, o)
+		})
+	}
+	return eg.Wait()
 }

@@ -1,18 +1,24 @@
-// +build !windows
+//go:build !windows
 
 package main
 
 import (
 	"crypto/tls"
 	"net"
+	"os"
 	"syscall"
 
+	"github.com/containerd/containerd/v2/pkg/sys"
 	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/pkg/errors"
+	copy "github.com/tonistiigi/fsutil/copy"
 )
+
+const socketScheme = "unix://"
 
 func init() {
 	syscall.Umask(0)
+	copy.UmaskIsZero = true
 }
 
 func listenFD(addr string, tlsConfig *tls.Config) (net.Listener, error) {
@@ -41,4 +47,21 @@ func listenFD(addr string, tlsConfig *tls.Config) (net.Listener, error) {
 
 	//TODO: systemd fd selection (default is 3)
 	return nil, errors.New("not supported yet")
+}
+
+func getLocalListener(listenerPath, _ string) (net.Listener, error) {
+	uid := os.Getuid()
+	l, err := sys.GetLocalListener(listenerPath, uid, uid)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(listenerPath, 0666); err != nil {
+		l.Close()
+		return nil, err
+	}
+	return l, nil
+}
+
+func groupToSecurityDescriptor(_ string) (string, error) {
+	return "", nil
 }

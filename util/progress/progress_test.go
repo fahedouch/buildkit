@@ -4,20 +4,24 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
 
 func TestProgress(t *testing.T) {
 	t.Parallel()
-	s, err := calc(context.TODO(), 4, "calc")
-	assert.NoError(t, err)
+	s, err := calc(t.Context(), 4, "calc")
+	require.NoError(t, err)
 	assert.Equal(t, 10, s)
 
-	eg, ctx := errgroup.WithContext(context.Background())
+	eg, ctx := errgroup.WithContext(t.Context())
 
 	pr, ctx, cancelProgress := NewContext(ctx)
 	var trace trace
@@ -25,48 +29,59 @@ func TestProgress(t *testing.T) {
 		return saveProgress(ctx, pr, &trace)
 	})
 
-	pw, _, ctx := FromContext(ctx, WithMetadata("tag", "foo"))
-	s, err = calc(ctx, 5, "calc")
+	pw, _, ctx2 := NewFromContext(ctx, WithMetadata("tag", "foo"))
+	s, err = calc(ctx2, 5, "calc")
 	pw.Close()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 15, s)
 
-	cancelProgress()
+	cancelProgress(errors.WithStack(context.Canceled))
 	err = eg.Wait()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	assert.True(t, len(trace.items) > 5)
-	assert.True(t, len(trace.items) <= 7)
+	assert.Greater(t, len(trace.items), 5)
+	assert.LessOrEqual(t, len(trace.items), 7)
 	for _, p := range trace.items {
 		v, ok := p.Meta("tag")
 		assert.True(t, ok)
-		assert.Equal(t, v.(string), "foo")
+		assert.Equal(t, "foo", v.(string))
 	}
 }
 
 func TestProgressNested(t *testing.T) {
 	t.Parallel()
-	eg, ctx := errgroup.WithContext(context.Background())
+	eg, ctx := errgroup.WithContext(t.Context())
 	pr, ctx, cancelProgress := NewContext(ctx)
 	var trace trace
 	eg.Go(func() error {
 		return saveProgress(ctx, pr, &trace)
 	})
 	s, err := reduceCalc(ctx, 3)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 6, s)
 
-	cancelProgress()
+	cancelProgress(errors.WithStack(context.Canceled))
 
 	err = eg.Wait()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	assert.True(t, len(trace.items) > 9) // usually 14
-	assert.True(t, len(trace.items) <= 15)
+	last := map[string]*Progress{}
+	for _, p := range trace.items {
+		prev, ok := last[p.ID]
+		if !ok || p.Timestamp.After(prev.Timestamp) {
+			last[p.ID] = p
+		}
+	}
+
+	require.ElementsMatch(t, []string{"reduce", "synccalc", "calc-0", "calc-1"}, slices.Collect(maps.Keys(last)))
+	assert.Equal(t, Status{Action: "starting"}, last["reduce"].Sys)
+	for _, id := range []string{"synccalc", "calc-0", "calc-1"} {
+		assert.Equal(t, Status{Action: "done", Current: 3, Total: 3}, last[id].Sys)
+	}
 }
 
 func calc(ctx context.Context, total int, name string) (int, error) {
-	pw, _, ctx := FromContext(ctx)
+	pw, _, ctx := NewFromContext(ctx)
 	defer pw.Close()
 
 	sum := 0
@@ -74,7 +89,7 @@ func calc(ctx context.Context, total int, name string) (int, error) {
 	for i := 1; i <= total; i++ {
 		select {
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return 0, context.Cause(ctx)
 		case <-time.After(10 * time.Millisecond):
 		}
 		if i == total {
@@ -91,7 +106,7 @@ func calc(ctx context.Context, total int, name string) (int, error) {
 func reduceCalc(ctx context.Context, total int) (int, error) {
 	eg, ctx := errgroup.WithContext(ctx)
 
-	pw, _, ctx := FromContext(ctx)
+	pw, _, ctx := NewFromContext(ctx)
 	defer pw.Close()
 
 	pw.Write("reduce", Status{Action: "starting"})
@@ -102,7 +117,7 @@ func reduceCalc(ctx context.Context, total int) (int, error) {
 		return 0, err
 	}
 	// parallel steps
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		func(i int) {
 			eg.Go(func() error {
 				_, err := calc(ctx, total, fmt.Sprintf("calc-%d", i))
@@ -124,11 +139,41 @@ func saveProgress(ctx context.Context, pr Reader, t *trace) error {
 	for {
 		p, err := pr.Read(ctx)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
 		}
 		t.items = append(t.items, p...)
 	}
+}
+
+// TestWriteDuringClose checks that a progress writer can be closed while
+// another goroutine is still writing to it. Run with -race to detect
+// unsynchronized access to the writer's closed state.
+func TestWriteDuringClose(t *testing.T) {
+	t.Parallel()
+
+	_, ctx, closeProgress := NewContext(t.Context())
+	defer closeProgress(nil)
+
+	pw, ok, _ := NewFromContext(ctx)
+	require.True(t, ok)
+
+	start := make(chan struct{})
+	eg := errgroup.Group{}
+	eg.Go(func() error {
+		<-start
+		for range 100 {
+			pw.Write("vtx", struct{}{})
+		}
+		return nil
+	})
+	eg.Go(func() error {
+		<-start
+		return pw.Close()
+	})
+	close(start)
+	require.NoError(t, eg.Wait())
+	require.Error(t, pw.Write("vtx", struct{}{}))
 }

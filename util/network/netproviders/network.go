@@ -2,10 +2,12 @@ package netproviders
 
 import (
 	"os"
+	"strconv"
 
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/network"
 	"github.com/moby/buildkit/util/network/cniprovider"
+	"github.com/moby/buildkit/util/network/proxyprovider"
 	"github.com/pkg/errors"
 )
 
@@ -14,44 +16,78 @@ type Opt struct {
 	Mode string
 }
 
-// Providers returns the network provider set
-func Providers(opt Opt) (map[pb.NetMode]network.Provider, error) {
+// Providers returns the network provider set.
+// When opt.Mode is "auto" or "", resolvedMode is set to either "cni" or "host".
+func Providers(opt Opt) (providers map[pb.NetMode]network.Provider, proxyProvider network.ProxyProvider, resolvedMode string, err error) {
 	var defaultProvider network.Provider
 	switch opt.Mode {
 	case "cni":
 		cniProvider, err := cniprovider.New(opt.CNI)
 		if err != nil {
-			return nil, err
+			return nil, nil, resolvedMode, err
 		}
 		defaultProvider = cniProvider
+		resolvedMode = opt.Mode
 	case "host":
 		hostProvider, ok := getHostProvider()
 		if !ok {
-			return nil, errors.New("no host network support on this platform")
+			return nil, nil, resolvedMode, errors.New("no host network support on this platform")
 		}
 		defaultProvider = hostProvider
+		resolvedMode = opt.Mode
+	case "bridge":
+		bridgeProvider, err := getBridgeProvider(opt.CNI)
+		if err != nil {
+			return nil, nil, resolvedMode, err
+		}
+		defaultProvider = bridgeProvider
+		resolvedMode = "cni"
 	case "auto", "":
-		if _, err := os.Stat(opt.CNI.ConfigPath); err == nil {
+		if v, err := strconv.ParseBool(os.Getenv("BUILDKIT_NETWORK_BRIDGE_AUTO")); v && err == nil {
+			bridgeProvider, err := getBridgeProvider(opt.CNI)
+			if err != nil {
+				return nil, nil, resolvedMode, err
+			}
+			defaultProvider = bridgeProvider
+			resolvedMode = "cni"
+		} else if _, err := os.Stat(opt.CNI.ConfigPath); err == nil {
 			cniProvider, err := cniprovider.New(opt.CNI)
 			if err != nil {
-				return nil, err
+				return nil, nil, resolvedMode, err
 			}
 			defaultProvider = cniProvider
+			resolvedMode = "cni"
 		} else {
-			defaultProvider = getFallback()
+			defaultProvider, resolvedMode = getFallback()
 		}
 	default:
-		return nil, errors.Errorf("invalid network mode: %q", opt.Mode)
+		return nil, nil, resolvedMode, errors.Errorf("invalid network mode: %q", opt.Mode)
 	}
 
-	providers := map[pb.NetMode]network.Provider{
+	providers = map[pb.NetMode]network.Provider{
 		pb.NetMode_UNSET: defaultProvider,
 		pb.NetMode_NONE:  network.NewNoneProvider(),
+	}
+	if proxyprovider.Supported() {
+		proxyEgressProviders := map[pb.NetMode]network.Provider{
+			pb.NetMode_UNSET: defaultProvider,
+		}
+		if hostProvider, ok := getHostProvider(); ok {
+			proxyEgressProviders[pb.NetMode_HOST] = hostProvider
+		}
+		proxyProvider, err = proxyprovider.New(proxyprovider.Opt{
+			Root:            opt.CNI.Root,
+			PoolSize:        opt.CNI.PoolSize,
+			EgressProviders: proxyEgressProviders,
+		})
+		if err != nil {
+			return nil, nil, resolvedMode, err
+		}
 	}
 
 	if hostProvider, ok := getHostProvider(); ok {
 		providers[pb.NetMode_HOST] = hostProvider
 	}
 
-	return providers, nil
+	return providers, proxyProvider, resolvedMode, nil
 }

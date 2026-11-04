@@ -1,39 +1,168 @@
 package oci
 
 import (
-	"context"
-	"io/ioutil"
+	"fmt"
 	"os"
+	"path"
 	"testing"
+	"time"
 
-	"github.com/docker/libnetwork/resolvconf"
+	"github.com/moby/buildkit/solver/pb"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
-// TestResolvConfNotExist modifies a global variable
-// It must not run in parallel.
-func TestResolvConfNotExist(t *testing.T) {
-	oldResolvconfGet := resolvconfGet
-	defer func() {
-		resolvconfGet = oldResolvconfGet
-	}()
-	resolvconfGet = func() (*resolvconf.File, error) {
-		return nil, os.ErrNotExist
-	}
-
-	defaultResolvConf := `
-nameserver 8.8.8.8
+const defaultResolvConf = `nameserver 8.8.8.8
 nameserver 8.8.4.4
 nameserver 2001:4860:4860::8888
-nameserver 2001:4860:4860::8844`
+nameserver 2001:4860:4860::8844
+`
 
-	dir, err := ioutil.TempDir("", "buildkit-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-	ctx := context.Background()
-	p, err := GetResolvConf(ctx, dir, nil, nil)
-	require.NoError(t, err)
-	b, err := ioutil.ReadFile(p)
-	require.NoError(t, err)
-	require.Equal(t, string(b), defaultResolvConf)
+const dnsOption = `options ndots:0
+`
+
+const localDNSResolvConf = `nameserver 127.0.0.11
+options ndots:0
+`
+
+const regularResolvConf = `nameserver 192.168.65.5
+`
+
+// TestResolvConf modifies a global variable
+// It must not run in parallel.
+func TestResolvConf(t *testing.T) {
+	cases := []struct {
+		name        string
+		dt          []byte
+		execution   int
+		networkMode []pb.NetMode
+		expected    []string
+	}{
+		{
+			name:        "TestResolvConfNotExist",
+			dt:          nil,
+			execution:   1,
+			networkMode: []pb.NetMode{pb.NetMode_UNSET},
+			expected:    []string{defaultResolvConf},
+		},
+		{
+			name:        "TestNetModeIsHostResolvConfNotExist",
+			dt:          nil,
+			execution:   1,
+			networkMode: []pb.NetMode{pb.NetMode_HOST},
+			expected:    []string{defaultResolvConf},
+		},
+		{
+			name:        "TestNetModeIsHostWithoutLocalDNS",
+			dt:          []byte(regularResolvConf),
+			execution:   1,
+			networkMode: []pb.NetMode{pb.NetMode_HOST},
+			expected:    []string{regularResolvConf},
+		},
+		{
+			name:        "TestNetModeIsHostWithLocalDNS",
+			dt:          []byte(localDNSResolvConf),
+			execution:   1,
+			networkMode: []pb.NetMode{pb.NetMode_HOST},
+			expected:    []string{localDNSResolvConf},
+		},
+		{
+			name:        "TestNetModeNotHostWithoutLocalDNS",
+			dt:          []byte(regularResolvConf),
+			execution:   1,
+			networkMode: []pb.NetMode{pb.NetMode_UNSET},
+			expected:    []string{regularResolvConf},
+		},
+		{
+			name:        "TestNetModeNotHostWithLocalDNS",
+			dt:          []byte(localDNSResolvConf),
+			execution:   1,
+			networkMode: []pb.NetMode{pb.NetMode_UNSET},
+			expected:    []string{fmt.Sprintf("%s%s", defaultResolvConf, dnsOption)},
+		},
+		{
+			name:        "TestRegenerateResolvconfToRemoveLocalDNS",
+			dt:          []byte(localDNSResolvConf),
+			execution:   2,
+			networkMode: []pb.NetMode{pb.NetMode_HOST, pb.NetMode_UNSET},
+			expected: []string{
+				localDNSResolvConf,
+				fmt.Sprintf("%s%s", defaultResolvConf, dnsOption),
+			},
+		},
+		{
+			name:        "TestRegenerateResolvconfToAddLocalDNS",
+			dt:          []byte(localDNSResolvConf),
+			execution:   2,
+			networkMode: []pb.NetMode{pb.NetMode_UNSET, pb.NetMode_HOST},
+			expected: []string{
+				fmt.Sprintf("%s%s", defaultResolvConf, dnsOption),
+				localDNSResolvConf,
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			tempDir := t.TempDir()
+			oldResolvconfPath := resolvconfPath
+			t.Cleanup(func() {
+				resolvconfPath = oldResolvconfPath
+			})
+			for i := range tt.execution {
+				resolvconfPath = func(netMode pb.NetMode) string {
+					if tt.dt == nil {
+						return "no-such-file"
+					}
+					rpath := path.Join(t.TempDir(), "resolv.conf")
+					require.NoError(t, os.WriteFile(rpath, tt.dt, 0600))
+					require.Equal(t, tt.networkMode[i], netMode)
+					return rpath
+				}
+				if i > 0 {
+					time.Sleep(100 * time.Millisecond)
+				}
+				root, err := os.OpenRoot(tempDir)
+				require.NoError(t, err)
+				defer root.Close()
+
+				p, err := GetResolvConf(ctx, root, nil, nil, tt.networkMode[i])
+				require.NoError(t, err)
+				b, err := root.ReadFile(p)
+				require.NoError(t, err)
+				require.Equal(t, tt.expected[i], string(b))
+			}
+		})
+	}
+}
+
+// TestResolvConfConcurrentRoots checks that resolv.conf is generated for every
+// root when called for different roots concurrently. Run with -race to detect
+// unsynchronized access to the package-level generation state.
+func TestResolvConfConcurrentRoots(t *testing.T) {
+	const n = 4
+	roots := make([]*os.Root, n)
+	paths := make([]string, n)
+	start := make(chan struct{})
+	eg, ctx := errgroup.WithContext(t.Context())
+	for i := range n {
+		root, err := os.OpenRoot(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { root.Close() })
+		roots[i] = root
+		eg.Go(func() error {
+			<-start
+			p, err := GetResolvConf(ctx, root, nil, nil, pb.NetMode_UNSET)
+			paths[i] = p
+			return err
+		})
+	}
+	close(start)
+	require.NoError(t, eg.Wait())
+
+	for i, root := range roots {
+		_, err := root.Stat(paths[i])
+		require.NoError(t, err)
+	}
 }

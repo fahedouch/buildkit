@@ -2,93 +2,84 @@ package common
 
 import (
 	"context"
-	"io"
 	"os"
-	"strings"
 
 	"github.com/moby/buildkit/util/appcontext"
-	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
-	"github.com/opentracing/opentracing-go/log"
-	jaeger "github.com/uber/jaeger-client-go"
-	"github.com/urfave/cli"
+	"github.com/moby/buildkit/util/tracing/delegated"
+	"github.com/moby/buildkit/util/tracing/detect"
+	"github.com/urfave/cli/v3"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
-func getTracer() (opentracing.Tracer, io.Closer) {
-	if traceAddr := os.Getenv("JAEGER_TRACE"); traceAddr != "" {
-		tr, err := jaeger.NewUDPTransport(traceAddr, 0)
-		if err != nil {
-			panic(err)
-		}
+func AttachAppContext(app *cli.Command) error {
+	baseCtx := appcontext.Context()
 
-		// metricsFactory := prometheus.New()
-		return jaeger.NewTracer(
-			"buildctl",
-			jaeger.NewConstSampler(true),
-			jaeger.NewRemoteReporter(tr),
-		)
+	exp, err := detect.NewSpanExporter(baseCtx)
+	if err != nil {
+		return err
 	}
 
-	return opentracing.NoopTracer{}, &nopCloser{}
-}
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithResource(detect.Resource()),
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithBatcher(delegated.DefaultExporter),
+	)
+	tracer := tp.Tracer("")
 
-func AttachAppContext(app *cli.App) {
-	ctx := appcontext.Context()
-
-	tracer, closer := getTracer()
-
-	var span opentracing.Span
+	var span trace.Span
 
 	for i, cmd := range app.Commands {
 		func(before cli.BeforeFunc) {
 			name := cmd.Name
-			app.Commands[i].Before = func(clicontext *cli.Context) error {
+			app.Commands[i].Before = func(_ context.Context, clicontext *cli.Command) (context.Context, error) {
+				cmdCtx := baseCtx
 				if before != nil {
-					if err := before(clicontext); err != nil {
-						return err
+					var err error
+					cmdCtx, err = before(cmdCtx, clicontext)
+					if err != nil {
+						return cmdCtx, err
+					}
+					if cmdCtx == nil {
+						cmdCtx = baseCtx
 					}
 				}
 
-				span = tracer.StartSpan(name)
-				span.LogFields(log.String("command", strings.Join(os.Args, " ")))
+				cmdCtx, span = tracer.Start(cmdCtx, name, trace.WithAttributes(
+					attribute.StringSlice("command", os.Args),
+				))
 
-				ctx = opentracing.ContextWithSpan(ctx, span)
-
-				clicontext.App.Metadata["context"] = ctx
-				return nil
+				clicontext.Root().Metadata["context"] = cmdCtx
+				return cmdCtx, nil
 			}
 		}(cmd.Before)
 	}
 
-	app.ExitErrHandler = func(clicontext *cli.Context, err error) {
-		if span != nil {
-			ext.Error.Set(span, true)
+	app.ExitErrHandler = func(_ context.Context, _ *cli.Command, err error) {
+		if span != nil && err != nil {
+			span.SetStatus(codes.Error, err.Error())
 		}
 		cli.HandleExitCoder(err)
 	}
 
 	after := app.After
-	app.After = func(clicontext *cli.Context) error {
+	app.After = func(ctx context.Context, clicontext *cli.Command) error {
 		if after != nil {
-			if err := after(clicontext); err != nil {
+			if err := after(ctx, clicontext); err != nil {
 				return err
 			}
 		}
 		if span != nil {
-			span.Finish()
+			span.End()
 		}
-		return closer.Close()
+
+		return tp.Shutdown(context.TODO())
 	}
-
-}
-
-func CommandContext(c *cli.Context) context.Context {
-	return c.App.Metadata["context"].(context.Context)
-}
-
-type nopCloser struct {
-}
-
-func (*nopCloser) Close() error {
 	return nil
+}
+
+func CommandContext(c *cli.Command) context.Context {
+	return c.Root().Metadata["context"].(context.Context)
 }

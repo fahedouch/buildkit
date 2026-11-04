@@ -1,6 +1,7 @@
 package echoserver
 
 import (
+	"context"
 	"io"
 	"net"
 )
@@ -11,7 +12,8 @@ type TestServer interface {
 }
 
 func NewTestServer(response string) (TestServer, error) {
-	ln, err := net.Listen("tcp", ":")
+	listener := net.ListenConfig{}
+	ln, err := listener.Listen(context.TODO(), "tcp", ":")
 	if err != nil {
 		return nil, err
 	}

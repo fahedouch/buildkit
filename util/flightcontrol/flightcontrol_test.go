@@ -2,10 +2,12 @@ package flightcontrol
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/moby/buildkit/util/progress"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,8 +16,8 @@ import (
 
 func TestNoCancel(t *testing.T) {
 	t.Parallel()
-	g := &Group{}
-	eg, ctx := errgroup.WithContext(context.Background())
+	g := &Group[string]{}
+	eg, ctx := errgroup.WithContext(t.Context())
 	var r1, r2 string
 	var counter int64
 	f := testFunc(100*time.Millisecond, "bar", &counter)
@@ -24,7 +26,7 @@ func TestNoCancel(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		r1 = ret1.(string)
+		r1 = ret1
 		return nil
 	})
 	eg.Go(func() error {
@@ -32,30 +34,30 @@ func TestNoCancel(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		r2 = ret2.(string)
+		r2 = ret2
 		return nil
 	})
 	err := eg.Wait()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, "bar", r1)
 	assert.Equal(t, "bar", r2)
-	assert.Equal(t, counter, int64(1))
+	assert.Equal(t, int64(1), counter)
 }
 
 func TestCancelOne(t *testing.T) {
 	t.Parallel()
-	g := &Group{}
-	eg, ctx := errgroup.WithContext(context.Background())
+	g := &Group[string]{}
+	eg, ctx := errgroup.WithContext(t.Context())
 	var r1, r2 string
 	var counter int64
 	f := testFunc(100*time.Millisecond, "bar", &counter)
-	ctx2, cancel := context.WithCancel(ctx)
+	ctx2, cancel := context.WithCancelCause(ctx)
 	eg.Go(func() error {
 		ret1, err := g.Do(ctx2, "foo", f)
-		assert.Error(t, err)
+		require.Error(t, err)
 		require.Equal(t, true, errors.Is(err, context.Canceled))
 		if err == nil {
-			r1 = ret1.(string)
+			r1 = ret1
 		}
 		return nil
 	})
@@ -64,30 +66,30 @@ func TestCancelOne(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		r2 = ret2.(string)
+		r2 = ret2
 		return nil
 	})
 	eg.Go(func() error {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case <-time.After(30 * time.Millisecond):
-			cancel()
+			cancel(errors.WithStack(context.Canceled))
 			return nil
 		}
 	})
 	err := eg.Wait()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, "", r1)
 	assert.Equal(t, "bar", r2)
-	assert.Equal(t, counter, int64(1))
+	assert.Equal(t, int64(1), counter)
 }
 
 func TestCancelRace(t *testing.T) {
 	// t.Parallel() // disabled for better timing consistency. works with parallel as well
 
-	g := &Group{}
-	ctx, cancel := context.WithCancel(context.Background())
+	g := &Group[struct{}]{}
+	ctx, cancel := context.WithCancelCause(t.Context())
 
 	kick := make(chan struct{})
 	wait := make(chan struct{})
@@ -95,11 +97,11 @@ func TestCancelRace(t *testing.T) {
 	count := 0
 
 	// first run cancels context, second returns cleanly
-	f := func(ctx context.Context) (interface{}, error) {
+	f := func(ctx context.Context) (struct{}, error) {
 		done := ctx.Done()
 		if count > 0 {
 			time.Sleep(100 * time.Millisecond)
-			return nil, nil
+			return struct{}{}, nil
 		}
 		go func() {
 			for {
@@ -117,19 +119,19 @@ func TestCancelRace(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		select {
 		case <-done:
-			return nil, ctx.Err()
+			return struct{}{}, context.Cause(ctx)
 		case <-time.After(200 * time.Millisecond):
 		}
-		return nil, nil
+		return struct{}{}, nil
 	}
 
 	go func() {
 		defer close(wait)
 		<-kick
-		cancel()
+		cancel(errors.WithStack(context.Canceled))
 		time.Sleep(5 * time.Millisecond)
-		_, err := g.Do(context.Background(), "foo", f)
-		require.NoError(t, err)
+		_, err := g.Do(t.Context(), "foo", f)
+		assert.NoError(t, err)
 	}()
 
 	_, err := g.Do(ctx, "foo", f)
@@ -140,75 +142,161 @@ func TestCancelRace(t *testing.T) {
 
 func TestCancelBoth(t *testing.T) {
 	t.Parallel()
-	g := &Group{}
-	eg, ctx := errgroup.WithContext(context.Background())
+	g := &Group[string]{}
+	eg, ctx := errgroup.WithContext(t.Context())
 	var r1, r2 string
 	var counter int64
 	f := testFunc(200*time.Millisecond, "bar", &counter)
-	ctx2, cancel2 := context.WithCancel(ctx)
-	ctx3, cancel3 := context.WithCancel(ctx)
+	ctx2, cancel2 := context.WithCancelCause(ctx)
+	ctx3, cancel3 := context.WithCancelCause(ctx)
 	eg.Go(func() error {
 		ret1, err := g.Do(ctx2, "foo", f)
-		assert.Error(t, err)
+		require.Error(t, err)
 		require.Equal(t, true, errors.Is(err, context.Canceled))
 		if err == nil {
-			r1 = ret1.(string)
+			r1 = ret1
 		}
 		return nil
 	})
 	eg.Go(func() error {
 		ret2, err := g.Do(ctx3, "foo", f)
-		assert.Error(t, err)
+		require.Error(t, err)
 		require.Equal(t, true, errors.Is(err, context.Canceled))
 		if err == nil {
-			r2 = ret2.(string)
+			r2 = ret2
 		}
 		return nil
 	})
 	eg.Go(func() error {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case <-time.After(20 * time.Millisecond):
-			cancel2()
+			cancel2(errors.WithStack(context.Canceled))
 			return nil
 		}
 	})
 	eg.Go(func() error {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case <-time.After(50 * time.Millisecond):
-			cancel3()
+			cancel3(errors.WithStack(context.Canceled))
 			return nil
 		}
 	})
 	err := eg.Wait()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, "", r1)
 	assert.Equal(t, "", r2)
-	assert.Equal(t, counter, int64(1))
-	ret1, err := g.Do(context.TODO(), "foo", f)
-	assert.NoError(t, err)
-	assert.Equal(t, ret1, "bar")
+	assert.Equal(t, int64(1), counter)
+	ret1, err := g.Do(t.Context(), "foo", f)
+	require.NoError(t, err)
+	assert.Equal(t, "bar", ret1)
 
-	f2 := testFunc(100*time.Millisecond, "baz", &counter)
-	ret1, err = g.Do(context.TODO(), "foo", f2)
-	assert.NoError(t, err)
-	assert.Equal(t, ret1, "baz")
-	ret1, err = g.Do(context.TODO(), "abc", f)
-	assert.NoError(t, err)
-	assert.Equal(t, ret1, "bar")
+	ret1, err = g.Do(t.Context(), "abc", f)
+	require.NoError(t, err)
+	assert.Equal(t, "bar", ret1)
 
-	assert.Equal(t, counter, int64(4))
+	assert.Equal(t, int64(3), counter)
 }
 
-func testFunc(wait time.Duration, ret string, counter *int64) func(ctx context.Context) (interface{}, error) {
-	return func(ctx context.Context) (interface{}, error) {
+func TestContention(t *testing.T) {
+	perthread := 1000
+	threads := 100
+
+	wg := sync.WaitGroup{}
+	wg.Add(threads)
+
+	g := &Group[int]{}
+
+	for range threads {
+		for range perthread {
+			_, err := g.Do(t.Context(), "foo", func(ctx context.Context) (int, error) {
+				time.Sleep(time.Microsecond)
+				return 0, nil
+			})
+			require.NoError(t, err)
+		}
+		wg.Done()
+	}
+
+	wg.Wait()
+}
+
+func TestMassiveParallel(t *testing.T) {
+	var retryCount int64
+	g := &Group[string]{}
+	eg, ctx := errgroup.WithContext(t.Context())
+	for range 1000 {
+		eg.Go(func() error {
+			_, err := g.Do(ctx, "key", func(ctx context.Context) (string, error) {
+				return "", errors.New("always fail")
+			})
+			if errors.Is(err, errRetryTimeout) {
+				atomic.AddInt64(&retryCount, 1)
+			}
+			return err
+		})
+		// magic numbers to increase contention
+		time.Sleep(5 * time.Microsecond)
+	}
+	err := eg.Wait()
+	require.Error(t, err)
+	assert.Equal(t, int64(0), retryCount)
+}
+
+func TestCompletionAndWriterRemoval(t *testing.T) {
+	pr, _, closeProgress := progress.NewContext(t.Context())
+	closeProgress(nil)
+
+	ps := newProgressState()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	first := &closeWriter{onClose: func() {
+		close(entered)
+		<-release
+	}}
+	closes := 0
+	last := &closeWriter{onClose: func() { closes++ }}
+	ps.add(first)
+	ps.add(last)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ps.run(pr)
+	}()
+	// Cancel the second writer while completion is closing the first.
+	<-entered
+	ps.close(last)
+	close(release)
+	<-done
+	require.Equal(t, 1, closes, "each writer must be closed exactly once")
+}
+
+type closeWriter struct {
+	onClose func()
+}
+
+func (*closeWriter) Write(string, any) error {
+	return nil
+}
+
+func (*closeWriter) WriteRawProgress(*progress.Progress) error {
+	return nil
+}
+
+func (w *closeWriter) Close() error {
+	w.onClose()
+	return nil
+}
+
+func testFunc(wait time.Duration, ret string, counter *int64) func(ctx context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) {
 		atomic.AddInt64(counter, 1)
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return "", context.Cause(ctx)
 		case <-time.After(wait):
 			return ret, nil
 		}

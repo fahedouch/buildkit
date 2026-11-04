@@ -26,27 +26,33 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
-	"github.com/containerd/stargz-snapshotter/estargz/errorutil"
+	"github.com/klauspost/compress/zstd"
 	digest "github.com/opencontainers/go-digest"
-	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
 )
+
+type GzipHelperFunc func(io.Reader) (io.ReadCloser, error)
 
 type options struct {
 	chunkSize              int
 	compressionLevel       int
 	prioritizedFiles       []string
 	missedPrioritizedFiles *[]string
+	compression            Compression
+	ctx                    context.Context
+	minChunkSize           int
+	parallelism            int
+	gzipHelperFunc         GzipHelperFunc
 }
 
 type Option func(o *options) error
@@ -61,6 +67,7 @@ func WithChunkSize(chunkSize int) Option {
 
 // WithCompressionLevel option specifies the gzip compression level.
 // The default is gzip.BestCompression.
+// This option will be ignored if WithCompression option is used.
 // See also: https://godoc.org/compress/gzip#pkg-constants
 func WithCompressionLevel(level int) Option {
 	return func(o *options) error {
@@ -94,11 +101,68 @@ func WithAllowPrioritizeNotFound(missedFiles *[]string) Option {
 	}
 }
 
+// WithCompression specifies compression algorithm to be used.
+// Default is gzip.
+func WithCompression(compression Compression) Option {
+	return func(o *options) error {
+		o.compression = compression
+		return nil
+	}
+}
+
+// WithContext specifies a context that can be used for clean canceleration.
+func WithContext(ctx context.Context) Option {
+	return func(o *options) error {
+		o.ctx = ctx
+		return nil
+	}
+}
+
+// WithMinChunkSize option specifies the minimal number of bytes of data
+// must be written in one gzip stream.
+// By increasing this number, one gzip stream can contain multiple files
+// and it hopefully leads to smaller result blob.
+// NOTE: This adds a TOC property that old reader doesn't understand.
+func WithMinChunkSize(minChunkSize int) Option {
+	return func(o *options) error {
+		o.minChunkSize = minChunkSize
+		return nil
+	}
+}
+
+// WithParallelism option specifies the number of workers used to build the
+// layer. The tar is sliced into this many parts that are compressed
+// concurrently, so the value also fixes the resulting chunk boundaries: pinning
+// it makes builds reproducible across machines regardless of their CPU count.
+// Zero (the default) selects runtime.GOMAXPROCS(0); a value of 1 forces a fully
+// sequential build. This has no effect together with WithMinChunkSize, which is
+// always built with a single worker.
+func WithParallelism(workers int) Option {
+	return func(o *options) error {
+		o.parallelism = workers
+		return nil
+	}
+}
+
+// WithGzipHelperFunc option specifies a custom function to decompress gzip-compressed layers.
+// When a gzip-compressed layer is detected, this function will be used instead of the
+// Go standard library gzip decompression for better performance.
+// The function should take an io.Reader as input and return an io.ReadCloser.
+// If nil, the Go standard library gzip.NewReader will be used.
+func WithGzipHelperFunc(gzipHelperFunc GzipHelperFunc) Option {
+	return func(o *options) error {
+		o.gzipHelperFunc = gzipHelperFunc
+		return nil
+	}
+}
+
 // Blob is an eStargz blob.
 type Blob struct {
 	io.ReadCloser
-	diffID    digest.Digester
-	tocDigest digest.Digest
+	diffID           digest.Digester
+	tocDigest        digest.Digest
+	readCompleted    *atomic.Bool
+	uncompressedSize *atomic.Int64
 }
 
 // DiffID returns the digest of uncompressed blob.
@@ -112,11 +176,24 @@ func (b *Blob) TOCDigest() digest.Digest {
 	return b.tocDigest
 }
 
-// Build builds an eStargz blob which is an extended version of stargz, from tar blob passed
-// through the argument. If there are some prioritized files are listed in the option, these
-// files are grouped as "prioritized" and can be used for runtime optimization (e.g. prefetch).
-// This function builds a blob in parallel, with dividing that blob into several (at least the
-// number of runtime.GOMAXPROCS(0)) sub-blobs.
+// UncompressedSize returns the size of uncompressed blob.
+// UncompressedSize should only be called after the blob has been fully read.
+func (b *Blob) UncompressedSize() (int64, error) {
+	switch {
+	case b.uncompressedSize == nil || b.readCompleted == nil:
+		return -1, fmt.Errorf("readCompleted or uncompressedSize is not initialized")
+	case !b.readCompleted.Load():
+		return -1, fmt.Errorf("called UncompressedSize before the blob has been fully read")
+	default:
+		return b.uncompressedSize.Load(), nil
+	}
+}
+
+// Build builds an eStargz blob which is an extended version of stargz, from a blob (gzip, zstd
+// or plain tar) passed through the argument. If there are some prioritized files are listed in
+// the option, these files are grouped as "prioritized" and can be used for runtime optimization
+// (e.g. prefetch). This function builds a blob in parallel, with dividing that blob into several
+// (at least the number of runtime.GOMAXPROCS(0)) sub-blobs.
 func Build(tarBlob *io.SectionReader, opt ...Option) (_ *Blob, rErr error) {
 	var opts options
 	opts.compressionLevel = gzip.BestCompression // BestCompression by default
@@ -125,48 +202,95 @@ func Build(tarBlob *io.SectionReader, opt ...Option) (_ *Blob, rErr error) {
 			return nil, err
 		}
 	}
+	if opts.compression == nil {
+		opts.compression = newGzipCompressionWithLevel(opts.compressionLevel)
+	}
 	layerFiles := newTempFiles()
+	ctx := opts.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-done:
+			// nop
+		case <-ctx.Done():
+			layerFiles.CleanupAll()
+		}
+	}()
 	defer func() {
 		if rErr != nil {
 			if err := layerFiles.CleanupAll(); err != nil {
-				rErr = errors.Wrapf(rErr, "failed to cleanup tmp files: %v", err)
+				rErr = fmt.Errorf("failed to cleanup tmp files: %v: %w", err, rErr)
 			}
 		}
+		if cErr := ctx.Err(); cErr != nil {
+			rErr = fmt.Errorf("error from context %q: %w", cErr, rErr)
+		}
 	}()
+	tarBlob, err := decompressBlob(tarBlob, layerFiles, opts.gzipHelperFunc)
+	if err != nil {
+		return nil, err
+	}
 	entries, err := sortEntries(tarBlob, opts.prioritizedFiles, opts.missedPrioritizedFiles)
 	if err != nil {
 		return nil, err
 	}
-	tarParts := divideEntries(entries, runtime.GOMAXPROCS(0))
+	// The worker count slices the tar and so fixes the chunk boundaries; an
+	// explicit value is honored verbatim, which keeps builds reproducible across
+	// machines. Zero falls back to GOMAXPROCS.
+	workers := opts.parallelism
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+	var tarParts [][]*entry
+	if opts.minChunkSize > 0 {
+		// Each entry needs to know the size of the current gzip stream so they
+		// cannot be processed in parallel.
+		tarParts = [][]*entry{entries}
+	} else {
+		tarParts = divideEntries(entries, workers)
+	}
 	writers := make([]*Writer, len(tarParts))
 	payloads := make([]*os.File, len(tarParts))
-	var mu sync.Mutex
-	var eg errgroup.Group
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(tarParts)) // buffered to avoid goroutine leaks
 	for i, parts := range tarParts {
-		i, parts := i, parts
 		// builds verifiable stargz sub-blobs
-		eg.Go(func() error {
+		wg.Go(func() {
 			esgzFile, err := layerFiles.TempFile("", "esgzdata")
 			if err != nil {
-				return err
+				errCh <- err
+				return
 			}
-			sw := NewWriterLevel(esgzFile, opts.compressionLevel)
+			sw := NewWriterWithCompressor(esgzFile, opts.compression)
 			sw.ChunkSize = opts.chunkSize
-			if err := sw.AppendTar(readerFromEntries(parts...)); err != nil {
-				return err
+			sw.MinChunkSize = opts.minChunkSize
+			if sw.needsOpenGzEntries == nil {
+				sw.needsOpenGzEntries = make(map[string]struct{})
 			}
-			mu.Lock()
+			for _, f := range []string{PrefetchLandmark, NoPrefetchLandmark} {
+				sw.needsOpenGzEntries[f] = struct{}{}
+			}
+			if err := sw.AppendTar(readerFromEntries(parts...)); err != nil {
+				errCh <- err
+				return
+			}
 			writers[i] = sw
 			payloads[i] = esgzFile
-			mu.Unlock()
-			return nil
 		})
 	}
-	if err := eg.Wait(); err != nil {
-		rErr = err
-		return nil, err
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			return nil, err
+		}
 	}
-	tocAndFooter, tocDgst, err := closeWithCombine(opts.compressionLevel, writers...)
+	tocAndFooter, tocDgst, err := closeWithCombine(writers...)
 	if err != nil {
 		rErr = err
 		return nil, err
@@ -181,16 +305,28 @@ func Build(tarBlob *io.SectionReader, opt ...Option) (_ *Blob, rErr error) {
 	}
 	diffID := digest.Canonical.Digester()
 	pr, pw := io.Pipe()
+	readCompleted := new(atomic.Bool)
+	uncompressedSize := new(atomic.Int64)
 	go func() {
-		r, err := gzip.NewReader(io.TeeReader(io.MultiReader(append(rs, tocAndFooter)...), pw))
+		var size int64
+		var decompressFunc func(io.Reader) (io.ReadCloser, error)
+		if _, ok := opts.compression.(*gzipCompression); ok && opts.gzipHelperFunc != nil {
+			decompressFunc = opts.gzipHelperFunc
+		} else {
+			decompressFunc = opts.compression.Reader
+		}
+		decompressR, err := decompressFunc(io.TeeReader(io.MultiReader(append(rs, tocAndFooter)...), pw))
 		if err != nil {
 			pw.CloseWithError(err)
 			return
 		}
-		if _, err := io.Copy(diffID.Hash(), r); err != nil {
+		defer decompressR.Close()
+		if size, err = io.Copy(diffID.Hash(), decompressR); err != nil {
 			pw.CloseWithError(err)
 			return
 		}
+		uncompressedSize.Store(size)
+		readCompleted.Store(true)
 		pw.Close()
 	}()
 	return &Blob{
@@ -198,8 +334,10 @@ func Build(tarBlob *io.SectionReader, opt ...Option) (_ *Blob, rErr error) {
 			Reader:    pr,
 			closeFunc: layerFiles.CleanupAll,
 		},
-		tocDigest: tocDgst,
-		diffID:    diffID,
+		tocDigest:        tocDgst,
+		diffID:           diffID,
+		readCompleted:    readCompleted,
+		uncompressedSize: uncompressedSize,
 	}, nil
 }
 
@@ -208,7 +346,7 @@ func Build(tarBlob *io.SectionReader, opt ...Option) (_ *Blob, rErr error) {
 // Writers doesn't write TOC and footer to the underlying writers so they can be
 // combined into a single eStargz and tocAndFooter returned by this function can
 // be appended at the tail of that combined blob.
-func closeWithCombine(compressionLevel int, ws ...*Writer) (tocAndFooter io.Reader, tocDgst digest.Digest, err error) {
+func closeWithCombine(ws ...*Writer) (tocAndFooterR io.Reader, tocDgst digest.Digest, err error) {
 	if len(ws) == 0 {
 		return nil, "", fmt.Errorf("at least one writer must be passed")
 	}
@@ -225,7 +363,7 @@ func closeWithCombine(compressionLevel int, ws ...*Writer) (tocAndFooter io.Read
 		}
 	}
 	var (
-		mtoc          = new(jtoc)
+		mtoc          = new(JTOC)
 		currentOffset int64
 	)
 	mtoc.Version = ws[0].toc.Version
@@ -243,40 +381,16 @@ func closeWithCombine(compressionLevel int, ws ...*Writer) (tocAndFooter io.Read
 		currentOffset += w.cw.n
 	}
 
-	tocJSON, err := json.MarshalIndent(mtoc, "", "\t")
+	return tocAndFooter(ws[0].compressor, mtoc, currentOffset)
+}
+
+func tocAndFooter(compressor Compressor, toc *JTOC, offset int64) (io.Reader, digest.Digest, error) {
+	buf := new(bytes.Buffer)
+	tocDigest, err := compressor.WriteTOCAndFooter(buf, offset, toc, nil)
 	if err != nil {
 		return nil, "", err
 	}
-	pr, pw := io.Pipe()
-	go func() {
-		zw, _ := gzip.NewWriterLevel(pw, compressionLevel)
-		tw := tar.NewWriter(zw)
-		if err := tw.WriteHeader(&tar.Header{
-			Typeflag: tar.TypeReg,
-			Name:     TOCTarName,
-			Size:     int64(len(tocJSON)),
-		}); err != nil {
-			pw.CloseWithError(err)
-			return
-		}
-		if _, err := tw.Write(tocJSON); err != nil {
-			pw.CloseWithError(err)
-			return
-		}
-		if err := tw.Close(); err != nil {
-			pw.CloseWithError(err)
-			return
-		}
-		if err := zw.Close(); err != nil {
-			pw.CloseWithError(err)
-			return
-		}
-		pw.Close()
-	}()
-	return io.MultiReader(
-		pr,
-		bytes.NewReader(footerBytes(currentOffset)),
-	), digest.FromBytes(tocJSON), nil
+	return buf, tocDigest, nil
 }
 
 // divideEntries divides passed entries to the parts at least the number specified by the
@@ -313,18 +427,19 @@ func sortEntries(in io.ReaderAt, prioritized []string, missedPrioritized *[]stri
 	// Import tar file.
 	intar, err := importTar(in)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to sort")
+		return nil, fmt.Errorf("failed to sort: %w", err)
 	}
 
 	// Sort the tar file respecting to the prioritized files list.
 	sorted := &tarFile{}
+	picked := make(map[string]struct{})
 	for _, l := range prioritized {
-		if err := moveRec(l, intar, sorted); err != nil {
+		if err := moveRec(l, intar, sorted, picked); err != nil {
 			if errors.Is(err, errNotFound) && missedPrioritized != nil {
 				*missedPrioritized = append(*missedPrioritized, l)
 				continue // allow not found
 			}
-			return nil, errors.Wrap(err, "failed to sort tar entries")
+			return nil, fmt.Errorf("failed to sort tar entries: %w", err)
 		}
 	}
 	if len(prioritized) == 0 {
@@ -347,8 +462,8 @@ func sortEntries(in io.ReaderAt, prioritized []string, missedPrioritized *[]stri
 		})
 	}
 
-	// Dump all entry and concatinate them.
-	return append(sorted.dump(), intar.dump()...), nil
+	// Dump prioritized entries followed by the rest entries while skipping picked ones.
+	return append(sorted.dump(nil), intar.dump(picked)...), nil
 }
 
 // readerFromEntries returns a reader of tar archive that contains entries passed
@@ -360,11 +475,11 @@ func readerFromEntries(entries ...*entry) io.Reader {
 		defer tw.Close()
 		for _, entry := range entries {
 			if err := tw.WriteHeader(entry.header); err != nil {
-				pw.CloseWithError(fmt.Errorf("Failed to write tar header: %v", err))
+				pw.CloseWithError(fmt.Errorf("failed to write tar header: %v", err))
 				return
 			}
 			if _, err := io.Copy(tw, entry.payload); err != nil {
-				pw.CloseWithError(fmt.Errorf("Failed to write tar payload: %v", err))
+				pw.CloseWithError(fmt.Errorf("failed to write tar payload: %v", err))
 				return
 			}
 		}
@@ -375,9 +490,9 @@ func readerFromEntries(entries ...*entry) io.Reader {
 
 func importTar(in io.ReaderAt) (*tarFile, error) {
 	tf := &tarFile{}
-	pw, err := newCountReader(in)
+	pw, err := newCountReadSeeker(in)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to make position watcher")
+		return nil, fmt.Errorf("failed to make position watcher: %w", err)
 	}
 	tr := tar.NewReader(pw)
 
@@ -388,9 +503,8 @@ func importTar(in io.ReaderAt) (*tarFile, error) {
 		if err != nil {
 			if err == io.EOF {
 				break
-			} else {
-				return nil, errors.Wrap(err, "failed to parse tar file")
 			}
+			return nil, fmt.Errorf("failed to parse tar file, %w", err)
 		}
 		switch cleanEntryName(h.Name) {
 		case PrefetchLandmark, NoPrefetchLandmark:
@@ -411,36 +525,42 @@ func importTar(in io.ReaderAt) (*tarFile, error) {
 	return tf, nil
 }
 
-func moveRec(name string, in *tarFile, out *tarFile) error {
+func moveRec(name string, in *tarFile, out *tarFile, picked map[string]struct{}) error {
 	name = cleanEntryName(name)
 	if name == "" { // root directory. stop recursion.
 		if e, ok := in.get(name); ok {
 			// entry of the root directory exists. we should move it as well.
 			// this case will occur if tar entries are prefixed with "./", "/", etc.
-			out.add(e)
-			in.remove(name)
+			if _, done := picked[name]; !done {
+				out.add(e)
+				picked[name] = struct{}{}
+			}
 		}
 		return nil
 	}
 
 	_, okIn := in.get(name)
 	_, okOut := out.get(name)
-	if !okIn && !okOut {
-		return errors.Wrapf(errNotFound, "file: %q", name)
+	_, okPicked := picked[name]
+	if !okIn && !okOut && !okPicked {
+		return fmt.Errorf("file: %q: %w", name, errNotFound)
 	}
 
 	parent, _ := path.Split(strings.TrimSuffix(name, "/"))
-	if err := moveRec(parent, in, out); err != nil {
+	if err := moveRec(parent, in, out, picked); err != nil {
 		return err
 	}
 	if e, ok := in.get(name); ok && e.header.Typeflag == tar.TypeLink {
-		if err := moveRec(e.header.Linkname, in, out); err != nil {
+		if err := moveRec(e.header.Linkname, in, out, picked); err != nil {
 			return err
 		}
 	}
+	if _, done := picked[name]; done {
+		return nil
+	}
 	if e, ok := in.get(name); ok {
 		out.add(e)
-		in.remove(name)
+		picked[name] = struct{}{}
 	}
 	return nil
 }
@@ -486,8 +606,18 @@ func (f *tarFile) get(name string) (e *entry, ok bool) {
 	return
 }
 
-func (f *tarFile) dump() []*entry {
-	return f.stream
+func (f *tarFile) dump(skip map[string]struct{}) []*entry {
+	if len(skip) == 0 {
+		return f.stream
+	}
+	var out []*entry
+	for _, e := range f.stream {
+		if _, ok := skip[cleanEntryName(e.header.Name)]; ok {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 type readCloser struct {
@@ -512,12 +642,13 @@ func newTempFiles() *tempFiles {
 }
 
 type tempFiles struct {
-	files   []*os.File
-	filesMu sync.Mutex
+	files       []*os.File
+	filesMu     sync.Mutex
+	cleanupOnce sync.Once
 }
 
 func (tf *tempFiles) TempFile(dir, pattern string) (*os.File, error) {
-	f, err := ioutil.TempFile(dir, pattern)
+	f, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +658,14 @@ func (tf *tempFiles) TempFile(dir, pattern string) (*os.File, error) {
 	return f, nil
 }
 
-func (tf *tempFiles) CleanupAll() error {
+func (tf *tempFiles) CleanupAll() (err error) {
+	tf.cleanupOnce.Do(func() {
+		err = tf.cleanupAll()
+	})
+	return
+}
+
+func (tf *tempFiles) cleanupAll() error {
 	tf.filesMu.Lock()
 	defer tf.filesMu.Unlock()
 	var allErr []error
@@ -540,22 +678,22 @@ func (tf *tempFiles) CleanupAll() error {
 		}
 	}
 	tf.files = nil
-	return errorutil.Aggregate(allErr)
+	return errors.Join(allErr...)
 }
 
-func newCountReader(r io.ReaderAt) (*countReader, error) {
+func newCountReadSeeker(r io.ReaderAt) (*countReadSeeker, error) {
 	pos := int64(0)
-	return &countReader{r: r, cPos: &pos}, nil
+	return &countReadSeeker{r: r, cPos: &pos}, nil
 }
 
-type countReader struct {
+type countReadSeeker struct {
 	r    io.ReaderAt
 	cPos *int64
 
 	mu sync.Mutex
 }
 
-func (cr *countReader) Read(p []byte) (int, error) {
+func (cr *countReadSeeker) Read(p []byte) (int, error) {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 
@@ -566,18 +704,18 @@ func (cr *countReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (cr *countReader) Seek(offset int64, whence int) (int64, error) {
+func (cr *countReadSeeker) Seek(offset int64, whence int) (int64, error) {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 
 	switch whence {
 	default:
-		return 0, fmt.Errorf("Unknown whence: %v", whence)
+		return 0, fmt.Errorf("unknown whence: %v", whence)
 	case io.SeekStart:
 	case io.SeekCurrent:
 		offset += *cr.cPos
 	case io.SeekEnd:
-		return 0, fmt.Errorf("Unsupported whence: %v", whence)
+		return 0, fmt.Errorf("unsupported whence: %v", whence)
 	}
 
 	if offset < 0 {
@@ -587,9 +725,54 @@ func (cr *countReader) Seek(offset int64, whence int) (int64, error) {
 	return offset, nil
 }
 
-func (cr *countReader) currentPos() int64 {
+func (cr *countReadSeeker) currentPos() int64 {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 
 	return *cr.cPos
+}
+
+func decompressBlob(org *io.SectionReader, tmp *tempFiles, gzipHelperFunc GzipHelperFunc) (*io.SectionReader, error) {
+	if org.Size() < 4 {
+		return org, nil
+	}
+	src := make([]byte, 4)
+	if _, err := org.Read(src); err != nil && err != io.EOF {
+		return nil, err
+	}
+	var dR io.Reader
+	if bytes.Equal([]byte{0x1F, 0x8B, 0x08}, src[:3]) {
+		// gzip
+		var dgR io.ReadCloser
+		var err error
+		if gzipHelperFunc != nil {
+			dgR, err = gzipHelperFunc(io.NewSectionReader(org, 0, org.Size()))
+		} else {
+			dgR, err = gzip.NewReader(io.NewSectionReader(org, 0, org.Size()))
+		}
+		if err != nil {
+			return nil, err
+		}
+		defer dgR.Close()
+		dR = io.Reader(dgR)
+	} else if bytes.Equal([]byte{0x28, 0xb5, 0x2f, 0xfd}, src[:4]) {
+		// zstd
+		dzR, err := zstd.NewReader(io.NewSectionReader(org, 0, org.Size()))
+		if err != nil {
+			return nil, err
+		}
+		defer dzR.Close()
+		dR = io.Reader(dzR)
+	} else {
+		// uncompressed
+		return io.NewSectionReader(org, 0, org.Size()), nil
+	}
+	b, err := tmp.TempFile("", "uncompresseddata")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(b, dR); err != nil {
+		return nil, err
+	}
+	return fileSectionReader(b)
 }

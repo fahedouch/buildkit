@@ -1,7 +1,10 @@
+//go:build windows
+
 package regstate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -9,17 +12,17 @@ import (
 	"reflect"
 	"syscall"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
-//go:generate go run $GOROOT/src/syscall/mksyscall_windows.go -output zsyscall_windows.go regstate.go
+//go:generate go tool github.com/Microsoft/go-winio/tools/mkwinsyscall -output zsyscall_windows.go regstate.go
 
 //sys	regCreateKeyEx(key syscall.Handle, subkey *uint16, reserved uint32, class *uint16, options uint32, desired uint32, sa *syscall.SecurityAttributes, result *syscall.Handle, disposition *uint32) (regerrno error) = advapi32.RegCreateKeyExW
 
 const (
 	_REG_OPTION_VOLATILE = 1
 
-	_REG_CREATED_NEW_KEY     = 1
 	_REG_OPENED_EXISTING_KEY = 2
 )
 
@@ -34,16 +37,16 @@ var localUser = &Key{registry.CURRENT_USER, "HKEY_CURRENT_USER"}
 var rootPath = `SOFTWARE\Microsoft\runhcs`
 
 type NotFoundError struct {
-	Id string
+	ID string
 }
 
 func (err *NotFoundError) Error() string {
-	return fmt.Sprintf("ID '%s' was not found", err.Id)
+	return fmt.Sprintf("ID '%s' was not found", err.ID)
 }
 
 func IsNotFoundError(err error) bool {
-	_, ok := err.(*NotFoundError)
-	return ok
+	var e *NotFoundError
+	return errors.As(err, &e)
 }
 
 type NoStateError struct {
@@ -61,7 +64,8 @@ func createVolatileKey(k *Key, path string, access uint32) (newk *Key, openedExi
 		d uint32
 	)
 	fullpath := filepath.Join(k.Name, path)
-	err = regCreateKeyEx(syscall.Handle(k.Key), syscall.StringToUTF16Ptr(path), 0, nil, _REG_OPTION_VOLATILE, access, nil, &h, &d)
+	pathPtr, _ := windows.UTF16PtrFromString(path)
+	err = regCreateKeyEx(syscall.Handle(k.Key), pathPtr, 0, nil, _REG_OPTION_VOLATILE, access, nil, &h, &d)
 	if err != nil {
 		return nil, false, &os.PathError{Op: "RegCreateKeyEx", Path: fullpath, Err: err}
 	}
@@ -149,7 +153,8 @@ func (k *Key) openid(id string) (*Key, error) {
 	escaped := url.PathEscape(id)
 	fullpath := filepath.Join(k.Name, escaped)
 	nk, err := k.open(escaped)
-	if perr, ok := err.(*os.PathError); ok && perr.Err == syscall.ERROR_FILE_NOT_FOUND {
+	var perr *os.PathError
+	if errors.As(err, &perr) && errors.Is(perr.Err, syscall.ERROR_FILE_NOT_FOUND) {
 		return nil, &NotFoundError{id}
 	}
 	if err != nil {
@@ -162,7 +167,7 @@ func (k *Key) Remove(id string) error {
 	escaped := url.PathEscape(id)
 	err := registry.DeleteKey(k.Key, escaped)
 	if err != nil {
-		if err == syscall.ERROR_FILE_NOT_FOUND {
+		if err == syscall.ERROR_FILE_NOT_FOUND { //nolint:errorlint
 			return &NotFoundError{id}
 		}
 		return &os.PathError{Op: "RegDeleteKey", Path: filepath.Join(k.Name, escaped), Err: err}
@@ -212,7 +217,7 @@ func (k *Key) set(id string, create bool, key string, state interface{}) error {
 		err = sk.SetBinaryValue(key, js)
 	}
 	if err != nil {
-		if err == syscall.ERROR_FILE_NOT_FOUND {
+		if err == syscall.ERROR_FILE_NOT_FOUND { //nolint:errorlint
 			return &NoStateError{id, key}
 		}
 		return &os.PathError{Op: "RegSetValueEx", Path: sk.Name + ":" + key, Err: err}
@@ -236,7 +241,7 @@ func (k *Key) Clear(id, key string) error {
 	defer sk.Close()
 	err = sk.DeleteValue(key)
 	if err != nil {
-		if err == syscall.ERROR_FILE_NOT_FOUND {
+		if err == syscall.ERROR_FILE_NOT_FOUND { //nolint:errorlint
 			return &NoStateError{id, key}
 		}
 		return &os.PathError{Op: "RegDeleteValue", Path: sk.Name + ":" + key, Err: err}
@@ -275,7 +280,7 @@ func (k *Key) Get(id, key string, state interface{}) error {
 		js, _, err = sk.GetBinaryValue(key)
 	}
 	if err != nil {
-		if err == syscall.ERROR_FILE_NOT_FOUND {
+		if err == syscall.ERROR_FILE_NOT_FOUND { //nolint:errorlint
 			return &NoStateError{id, key}
 		}
 		return &os.PathError{Op: "RegQueryValueEx", Path: sk.Name + ":" + key, Err: err}

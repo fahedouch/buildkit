@@ -2,58 +2,58 @@ package contentutil
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"testing"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	cerrdefs "github.com/containerd/errdefs"
 	digest "github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
 func TestReadWrite(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	b := NewBuffer()
 
-	err := content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foo0")), ocispec.Descriptor{Size: -1})
+	err := content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foo0")), ocispecs.Descriptor{})
 	require.NoError(t, err)
 
-	err = content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foo1")), ocispec.Descriptor{Size: 4})
+	err = content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foo1")), ocispecs.Descriptor{Size: 4})
 	require.NoError(t, err)
 
-	err = content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foo2")), ocispec.Descriptor{Size: 3})
+	err = content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foo2")), ocispecs.Descriptor{Size: 3})
 	require.Error(t, err)
 
-	err = content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foo3")), ocispec.Descriptor{Size: -1, Digest: digest.FromBytes([]byte("foo4"))})
+	err = content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foo3")), ocispecs.Descriptor{Digest: digest.FromBytes([]byte("foo4"))})
 	require.Error(t, err)
 
-	err = content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foo4")), ocispec.Descriptor{Size: -1, Digest: digest.FromBytes([]byte("foo4"))})
+	err = content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foo4")), ocispecs.Descriptor{Digest: digest.FromBytes([]byte("foo4"))})
 	require.NoError(t, err)
 
-	dt, err := content.ReadBlob(ctx, b, ocispec.Descriptor{Digest: digest.FromBytes([]byte("foo1"))})
+	dt, err := content.ReadBlob(ctx, b, ocispecs.Descriptor{Digest: digest.FromBytes([]byte("foo1"))})
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "foo1")
+	require.Equal(t, "foo1", string(dt))
 
-	_, err = content.ReadBlob(ctx, b, ocispec.Descriptor{Digest: digest.FromBytes([]byte("foo3"))})
+	_, err = content.ReadBlob(ctx, b, ocispecs.Descriptor{Digest: digest.FromBytes([]byte("foo3"))})
 	require.Error(t, err)
-	require.Equal(t, true, errors.Is(err, errdefs.ErrNotFound))
+	require.Equal(t, true, errors.Is(err, cerrdefs.ErrNotFound))
 }
 
 func TestReaderAt(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	b := NewBuffer()
 
-	err := content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foobar")), ocispec.Descriptor{Size: -1})
+	err := content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foobar")), ocispecs.Descriptor{})
 	require.NoError(t, err)
 
-	rdr, err := b.ReaderAt(ctx, ocispec.Descriptor{Digest: digest.FromBytes([]byte("foobar"))})
+	rdr, err := b.ReaderAt(ctx, ocispecs.Descriptor{Digest: digest.FromBytes([]byte("foobar"))})
 	require.NoError(t, err)
 
 	require.Equal(t, int64(6), rdr.Size())
@@ -70,4 +70,50 @@ func TestReaderAt(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, err, io.EOF)
 	require.Equal(t, "bar", string(buf[:n]))
+}
+
+func TestLabels(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	b := NewBuffer()
+
+	err := content.WriteBlob(ctx, b, "foo", bytes.NewBuffer([]byte("foobar")), ocispecs.Descriptor{})
+	require.NoError(t, err)
+
+	_, err = b.Info(ctx, digest.FromBytes([]byte("abc")))
+	require.Error(t, err)
+
+	info, err := b.Info(ctx, digest.FromBytes([]byte("foobar")))
+	require.NoError(t, err)
+
+	require.Equal(t, info.Digest, digest.FromBytes([]byte("foobar")))
+
+	hf, err := docker.AppendDistributionSourceLabel(b, "docker.io/library/busybox:latest")
+	require.NoError(t, err)
+	_, err = hf.Handle(ctx, ocispecs.Descriptor{Digest: digest.FromBytes([]byte("foobar"))})
+	require.NoError(t, err)
+
+	info, err = b.Info(ctx, digest.FromBytes([]byte("foobar")))
+	require.NoError(t, err)
+	require.Equal(t, info.Digest, digest.FromBytes([]byte("foobar")))
+
+	require.Equal(t, "library/busybox", info.Labels["containerd.io/distribution.source.docker.io"])
+
+	hf, err = docker.AppendDistributionSourceLabel(b, "docker.io/library/alpine:3.15")
+	require.NoError(t, err)
+	_, err = hf.Handle(ctx, ocispecs.Descriptor{Digest: digest.FromBytes([]byte("foobar"))})
+	require.NoError(t, err)
+
+	hf, err = docker.AppendDistributionSourceLabel(b, "ghcr.io/repos/alpine:3.11")
+	require.NoError(t, err)
+	_, err = hf.Handle(ctx, ocispecs.Descriptor{Digest: digest.FromBytes([]byte("foobar"))})
+	require.NoError(t, err)
+
+	info, err = b.Info(ctx, digest.FromBytes([]byte("foobar")))
+	require.NoError(t, err)
+	require.Equal(t, info.Digest, digest.FromBytes([]byte("foobar")))
+
+	require.Equal(t, "library/alpine,library/busybox", info.Labels["containerd.io/distribution.source.docker.io"])
+	require.Equal(t, "repos/alpine", info.Labels["containerd.io/distribution.source.ghcr.io"])
 }

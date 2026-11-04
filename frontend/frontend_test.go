@@ -2,7 +2,6 @@ package frontend
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	"github.com/moby/buildkit/client/llb"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/util/testutil/integration"
+	"github.com/moby/buildkit/util/testutil/workers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tonistiigi/fsutil"
@@ -19,33 +19,30 @@ import (
 )
 
 func init() {
-	if os.Getenv("TEST_DOCKERD") == "1" {
-		integration.InitDockerdWorker()
+	if workers.IsTestDockerd() {
+		workers.InitDockerdWorker()
 	} else {
-		integration.InitOCIWorker()
-		integration.InitContainerdWorker()
+		workers.InitOCIWorker()
+		workers.InitContainerdWorker()
 	}
 }
 
 func TestFrontendIntegration(t *testing.T) {
-	integration.Run(t, []integration.Test{
+	integration.Run(t, integration.TestFuncs(
 		testRefReadFile,
 		testRefReadDir,
 		testRefStatFile,
+		testRefEvaluate,
 		testReturnNil,
-	})
+	))
 }
 
 func testReturnNil(t *testing.T, sb integration.Sandbox) {
-	ctx := context.TODO()
+	ctx := sb.Context()
 
 	c, err := client.New(ctx, sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
-
-	destDir, err := ioutil.TempDir("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
 
 	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
 		return nil, nil
@@ -63,7 +60,7 @@ func testReturnNil(t *testing.T, sb integration.Sandbox) {
 }
 
 func testRefReadFile(t *testing.T, sb integration.Sandbox) {
-	ctx := context.TODO()
+	ctx := sb.Context()
 
 	c, err := client.New(ctx, sb.Address())
 	require.NoError(t, err)
@@ -71,11 +68,10 @@ func testRefReadFile(t *testing.T, sb integration.Sandbox) {
 
 	testcontent := []byte(`foobar`)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("test", testcontent, 0666),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
 		def, err := llb.Local("mylocal").Marshal(ctx)
@@ -120,7 +116,7 @@ func testRefReadFile(t *testing.T, sb integration.Sandbox) {
 	}
 
 	_, err = c.Build(ctx, client.SolveOpt{
-		LocalDirs: map[string]string{
+		LocalMounts: map[string]fsutil.FS{
 			"mylocal": dir,
 		},
 	}, "", frontend, nil)
@@ -128,13 +124,14 @@ func testRefReadFile(t *testing.T, sb integration.Sandbox) {
 }
 
 func testRefReadDir(t *testing.T, sb integration.Sandbox) {
-	ctx := context.TODO()
+	ctx := sb.Context()
 
 	c, err := client.New(ctx, sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateDir("somedir", 0777),
 		fstest.CreateFile("somedir/foo1.txt", []byte(`foo1`), 0666),
 		fstest.CreateFile("somedir/foo2.txt", []byte{}, 0666),
@@ -142,18 +139,16 @@ func testRefReadDir(t *testing.T, sb integration.Sandbox) {
 		fstest.Symlink("bar.log", "somedir/link.log"),
 		fstest.CreateDir("somedir/baz.dir", 0777),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	expMap := make(map[string]*fstypes.Stat)
 
-	fsutil.Walk(ctx, dir, nil, func(path string, info os.FileInfo, err error) error {
+	fsutil.Walk(ctx, dir.Name, nil, func(path string, info os.FileInfo, err error) error {
 		require.NoError(t, err)
 		stat, ok := info.Sys().(*fstypes.Stat)
 		require.True(t, ok)
 		stat.ModTime = 0                     // this will inevitably differ, we clear it during the tests below too
 		stat.Path = filepath.Base(stat.Path) // we are only testing reading a single directory here
-		expMap[path] = stat
+		expMap[filepath.ToSlash(path)] = stat
 		return nil
 	})
 
@@ -236,7 +231,7 @@ func testRefReadDir(t *testing.T, sb integration.Sandbox) {
 	}
 
 	_, err = c.Build(ctx, client.SolveOpt{
-		LocalDirs: map[string]string{
+		LocalMounts: map[string]fsutil.FS{
 			"mylocal": dir,
 		},
 	}, "", frontend, nil)
@@ -244,7 +239,7 @@ func testRefReadDir(t *testing.T, sb integration.Sandbox) {
 }
 
 func testRefStatFile(t *testing.T, sb integration.Sandbox) {
-	ctx := context.TODO()
+	ctx := sb.Context()
 
 	c, err := client.New(ctx, sb.Address())
 	require.NoError(t, err)
@@ -252,13 +247,12 @@ func testRefStatFile(t *testing.T, sb integration.Sandbox) {
 
 	testcontent := []byte(`foobar`)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("test", testcontent, 0666),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
-	exp, err := fsutil.Stat(filepath.Join(dir, "test"))
+	exp, err := fsutil.Stat(filepath.Join(dir.Name, "test"))
 	require.NoError(t, err)
 
 	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
@@ -289,20 +283,58 @@ func testRefStatFile(t *testing.T, sb integration.Sandbox) {
 	}
 
 	_, err = c.Build(ctx, client.SolveOpt{
-		LocalDirs: map[string]string{
+		LocalMounts: map[string]fsutil.FS{
 			"mylocal": dir,
 		},
 	}, "", frontend, nil)
 	require.NoError(t, err)
 }
 
-func tmpdir(appliers ...fstest.Applier) (string, error) {
-	tmpdir, err := ioutil.TempDir("", "buildkit-frontend")
-	if err != nil {
-		return "", err
+func testRefEvaluate(t *testing.T, sb integration.Sandbox) {
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		st := llb.Scratch().File(llb.Mkfile("/test", 0666, []byte{}))
+		def, err := st.Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		res, err := c.Solve(ctx, gateway.SolveRequest{
+			Definition: def.ToPB(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		ref, err := res.SingleRef()
+		if err != nil {
+			return nil, err
+		}
+
+		st = llb.Scratch().File(llb.Mkfile("/test/dir-does-not-exist", 0666, []byte{}))
+		def, err = st.Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		res, err = c.Solve(ctx, gateway.SolveRequest{
+			Definition: def.ToPB(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		ref2, err := res.SingleRef()
+		if err != nil {
+			return nil, err
+		}
+
+		require.NoError(t, ref.Evaluate(ctx))
+		require.Error(t, ref2.Evaluate(ctx))
+		return gateway.NewResult(), nil
 	}
-	if err := fstest.Apply(appliers...).Apply(tmpdir); err != nil {
-		return "", err
-	}
-	return tmpdir, nil
+
+	_, err = c.Build(ctx, client.SolveOpt{}, "", frontend, nil)
+	require.NoError(t, err)
 }

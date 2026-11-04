@@ -10,11 +10,11 @@ import (
 )
 
 func TestAsyncNonBlocking(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	wait := make(chan struct{})
 	ran := make(chan struct{})
-	st := Image("alpine").Dir("/foo").Async(func(ctx context.Context, st State) (State, error) {
+	st := Image("alpine").Dir("/foo").Async(func(ctx context.Context, st State, c *Constraints) (State, error) {
 		close(ran)
 		<-wait // make sure callback doesn't block the chain
 		return st.Run(Shlex("cmd1")).Dir("sub"), nil

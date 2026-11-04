@@ -1,28 +1,39 @@
 package dockerfile
 
 import (
-	"context"
-	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/frontend/dockerfile/builder"
+	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/secrets/secretsprovider"
 	"github.com/moby/buildkit/util/testutil/integration"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tonistiigi/fsutil"
 )
 
-var secretsTests = []integration.Test{
+var secretsTests = integration.TestFuncs(
 	testSecretFileParams,
-}
+	testSecretRequiredWithoutValue,
+	testSecretAsEnviron,
+	testSecretAsEnvironWithFileMount,
+	testSecretFileMount,
+)
 
 func init() {
 	allTests = append(allTests, secretsTests...)
 }
 
+// testSecretFileParams verifies that a secret mounted with custom permissions
+// (mode, uid, gid) has the correct ownership and mode, and that no stub file
+// is left behind after the RUN step.
 func testSecretFileParams(t *testing.T, sb integration.Sandbox) {
+	// mode/uid/gid are POSIX-only; BuildKit has no code path to map them to Windows ACLs.
+	integration.SkipOnPlatform(t, "windows", "Secret permission parameters not implemented for Windows in BuildKit")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -31,20 +42,204 @@ RUN --mount=type=secret,required=false,mode=741,uid=100,gid=102,target=/mysecret
 RUN [ ! -f /mysecret ] # check no stub left behind
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
-	c, err := client.New(context.TODO(), sb.Address())
+	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	_, err = f.Solve(context.TODO(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+		Session: []session.Attachable{secretsprovider.FromMap(map[string][]byte{
+			"mysecret": []byte("pw"),
+		})},
+	}, nil)
+	require.NoError(t, err)
+}
+
+// testSecretRequiredWithoutValue verifies that a build fails when a required
+// secret is referenced in the Dockerfile but no value is supplied by the client.
+func testSecretRequiredWithoutValue(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(integration.UnixOrWindows(
+		`FROM busybox 
+		RUN --mount=type=secret,required,id=mysecret foo`,
+
+		`FROM nanoserver
+		USER ContainerAdministrator
+		RUN --mount=type=secret,required,id=mysecret,target=C:/mysecret foo`,
+	))
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "secret mysecret: not found")
+}
+
+// testSecretAsEnviron verifies that a secret injected via env= is accessible
+// as an environment variable, is not left behind as a file mount, and is not
+// leaked in the vertex display name.
+func testSecretAsEnviron(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	// Forward slashes in Windows paths because the Dockerfile parser
+	// consumes backslashes as escapes.
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
+FROM busybox
+ENV SECRET_ENV=foo
+RUN --mount=type=secret,id=mysecret,env=SECRET_ENV [ "$SECRET_ENV" == "pw" ] && [ ! -f /run/secrets/mysecret ] || false
+`,
+		`
+FROM nanoserver
+USER ContainerAdministrator
+ENV SECRET_ENV=foo
+RUN --mount=type=secret,id=mysecret,env=SECRET_ENV if %SECRET_ENV% NEQ pw (exit 1) & if exist C:/run/secrets/mysecret (exit 1)
+`,
+	))
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	done := make(chan struct{})
+	status := make(chan *client.SolveStatus)
+	hasStatus := false
+
+	// Match the secret-path substring in the vertex name (differs per platform).
+	vertexSearch := integration.UnixOrWindows("/run/secrets/mysecret", "C:/run/secrets/mysecret")
+	// Linux: $SECRET_ENV scrubbed to "****".  Windows: %VAR% not expanded by lexer, stays literal.
+	maskedExpect := integration.UnixOrWindows(`[ "****" == "pw" ] && `, `%SECRET_ENV% NEQ pw`)
+
+	go func() {
+		for st := range status {
+			for _, v := range st.Vertexes {
+				if strings.Contains(v.Name, vertexSearch) {
+					hasStatus = true
+					assert.Contains(t, v.Name, maskedExpect)
+				}
+			}
+		}
+		close(done)
+	}()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+		Session: []session.Attachable{secretsprovider.FromMap(map[string][]byte{
+			"mysecret": []byte("pw"),
+		})},
+	}, status)
+	require.NoError(t, err)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "timed out waiting for status")
+	}
+
+	require.True(t, hasStatus)
+}
+
+// testSecretAsEnvironWithFileMount verifies that a secret with both env= and
+// target= is accessible as an environment variable and as a file.
+func testSecretAsEnvironWithFileMount(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	// Forward slashes in the Windows path because the Dockerfile parser
+	// consumes backslashes as escapes.
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
+FROM busybox
+RUN --mount=type=secret,id=mysecret,target=/run/secrets/secret,env=SECRET_ENV [ "$SECRET_ENV" == "pw" ] && [ -f /run/secrets/secret ] || false
+`,
+		`
+FROM nanoserver
+USER ContainerAdministrator
+RUN --mount=type=secret,id=mysecret,target=C:/run/secrets/secret,env=SECRET_ENV if %SECRET_ENV% NEQ pw (exit 1) & if not exist C:/run/secrets/secret (exit 1)
+`,
+	))
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+		Session: []session.Attachable{secretsprovider.FromMap(map[string][]byte{
+			"mysecret": []byte("pw"),
+		})},
+	}, nil)
+	require.NoError(t, err)
+}
+
+// testSecretFileMount verifies a secret mounted as a file (target=) is readable
+// inside the RUN step on both Linux and Windows.
+func testSecretFileMount(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	// Forward slashes in the Windows path because the Dockerfile parser
+	// consumes backslashes as escapes.
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
+FROM busybox
+RUN --mount=type=secret,id=mysecret,target=/secret.txt [ "$(cat /secret.txt)" = "pw" ] || false
+`,
+		`
+FROM nanoserver
+USER ContainerAdministrator
+RUN --mount=type=secret,id=mysecret,target=C:/secret.txt findstr pw C:\secret.txt
+`,
+	))
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 		Session: []session.Attachable{secretsprovider.FromMap(map[string][]byte{
 			"mysecret": []byte("pw"),

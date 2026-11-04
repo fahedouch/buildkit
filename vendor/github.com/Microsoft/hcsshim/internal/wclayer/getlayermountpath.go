@@ -1,13 +1,15 @@
+//go:build windows
+
 package wclayer
 
 import (
 	"context"
+	"go.opentelemetry.io/otel/attribute"
 	"syscall"
 
 	"github.com/Microsoft/hcsshim/internal/hcserror"
 	"github.com/Microsoft/hcsshim/internal/log"
-	"github.com/Microsoft/hcsshim/internal/oc"
-	"go.opencensus.io/trace"
+	"github.com/Microsoft/hcsshim/internal/ot"
 )
 
 // GetLayerMountPath will look for a mounted layer with the given path and return
@@ -16,19 +18,18 @@ import (
 // folder path at which the layer is stored.
 func GetLayerMountPath(ctx context.Context, path string) (_ string, err error) {
 	title := "hcsshim::GetLayerMountPath"
-	ctx, span := trace.StartSpan(ctx, title)
+	ctx, span := ot.StartSpan(ctx, title)
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(trace.StringAttribute("path", path))
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(attribute.String("path", path))
 
-	var mountPathLength uintptr
-	mountPathLength = 0
+	var mountPathLength uintptr = 0
 
 	// Call the procedure itself.
 	log.G(ctx).Debug("Calling proc (1)")
 	err = getLayerMountPath(&stdDriverInfo, path, &mountPathLength, nil)
 	if err != nil {
-		return "", hcserror.New(err, title+" - failed", "(first call)")
+		return "", hcserror.New(err, title, "(first call)")
 	}
 
 	// Allocate a mount path of the returned length.
@@ -42,10 +43,10 @@ func GetLayerMountPath(ctx context.Context, path string) (_ string, err error) {
 	log.G(ctx).Debug("Calling proc (2)")
 	err = getLayerMountPath(&stdDriverInfo, path, &mountPathLength, &mountPathp[0])
 	if err != nil {
-		return "", hcserror.New(err, title+" - failed", "(second call)")
+		return "", hcserror.New(err, title, "(second call)")
 	}
 
 	mountPath := syscall.UTF16ToString(mountPathp[0:])
-	span.AddAttributes(trace.StringAttribute("mountPath", mountPath))
+	span.SetAttributes(attribute.String("mountPath", mountPath))
 	return mountPath, nil
 }

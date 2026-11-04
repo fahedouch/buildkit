@@ -19,26 +19,26 @@ package snapshot
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/snapshots"
-	"github.com/containerd/containerd/snapshots/storage"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/core/snapshots/storage"
+	"github.com/containerd/containerd/v2/plugins/snapshots/overlay/overlayutils"
 	"github.com/containerd/continuity/fs"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 	"github.com/moby/sys/mountinfo"
-	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
 
 const (
 	targetSnapshotLabel = "containerd.io/snapshot.ref"
 	remoteLabel         = "containerd.io/snapshot/remote"
+	remoteLabelVal      = "remote snapshot"
 
 	// remoteSnapshotLogKey is a key for log line, which indicates whether
 	// `Prepare` method successfully prepared targeting remote snapshot or not, as
@@ -70,7 +70,9 @@ type FileSystem interface {
 
 // SnapshotterConfig is used to configure the remote snapshotter instance
 type SnapshotterConfig struct {
-	asyncRemove bool
+	asyncRemove                 bool
+	noRestore                   bool
+	allowInvalidMountsOnRestart bool
 }
 
 // Opt is an option to configure the remote snapshotter
@@ -85,13 +87,26 @@ func AsynchronousRemove(config *SnapshotterConfig) error {
 	return nil
 }
 
+func NoRestore(config *SnapshotterConfig) error {
+	config.noRestore = true
+	return nil
+}
+
+func AllowInvalidMountsOnRestart(config *SnapshotterConfig) error {
+	config.allowInvalidMountsOnRestart = true
+	return nil
+}
+
 type snapshotter struct {
 	root        string
 	ms          *storage.MetaStore
 	asyncRemove bool
 
 	// fs is a filesystem that this snapshotter recognizes.
-	fs FileSystem
+	fs                          FileSystem
+	userxattr                   bool // whether to enable "userxattr" mount option
+	noRestore                   bool
+	allowInvalidMountsOnRestart bool
 }
 
 // NewSnapshotter returns a Snapshotter which can use unpacked remote layers
@@ -100,7 +115,7 @@ type snapshotter struct {
 // the root as same as overlayfs snapshotter.
 func NewSnapshotter(ctx context.Context, root string, targetFs FileSystem, opts ...Opt) (snapshots.Snapshotter, error) {
 	if targetFs == nil {
-		return nil, fmt.Errorf("Specify filesystem to use")
+		return nil, fmt.Errorf("specify filesystem to use")
 	}
 
 	var config SnapshotterConfig
@@ -129,15 +144,23 @@ func NewSnapshotter(ctx context.Context, root string, targetFs FileSystem, opts 
 		return nil, err
 	}
 
+	userxattr, err := overlayutils.NeedsUserXAttr(root)
+	if err != nil {
+		log.G(ctx).WithError(err).Warnf("cannot detect whether \"userxattr\" option needs to be used, assuming to be %v", userxattr)
+	}
+
 	o := &snapshotter{
-		root:        root,
-		ms:          ms,
-		asyncRemove: config.asyncRemove,
-		fs:          targetFs,
+		root:                        root,
+		ms:                          ms,
+		asyncRemove:                 config.asyncRemove,
+		fs:                          targetFs,
+		userxattr:                   userxattr,
+		noRestore:                   config.noRestore,
+		allowInvalidMountsOnRestart: config.allowInvalidMountsOnRestart,
 	}
 
 	if err := o.restoreRemoteSnapshot(ctx); err != nil {
-		return nil, errors.Wrap(err, "failed to restore remote snapshot")
+		return nil, fmt.Errorf("failed to restore remote snapshot: %w", err)
 	}
 
 	return o, nil
@@ -236,25 +259,24 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 		//       or not, using the key `remoteSnapshotLogKey` defined in the above. This
 		//       log is used by tests in this project.
 		lCtx := log.WithLogger(ctx, log.G(ctx).WithField("key", key).WithField("parent", parent))
-		if err := o.prepareRemoteSnapshot(ctx, key, base.Labels); err != nil {
+		if err := o.prepareRemoteSnapshot(lCtx, key, base.Labels); err != nil {
 			log.G(lCtx).WithField(remoteSnapshotLogKey, prepareFailed).
-				WithError(err).Debug("failed to prepare remote snapshot")
+				WithError(err).Warn("failed to prepare remote snapshot")
 		} else {
-			base.Labels[remoteLabel] = fmt.Sprintf("remote snapshot") // Mark this snapshot as remote
-			err := o.Commit(ctx, target, key, append(opts, snapshots.WithLabels(base.Labels))...)
+			base.Labels[remoteLabel] = remoteLabelVal // Mark this snapshot as remote
+			err := o.commit(ctx, true, target, key, append(opts, snapshots.WithLabels(base.Labels))...)
 			if err == nil || errdefs.IsAlreadyExists(err) {
 				// count also AlreadyExists as "success"
 				log.G(lCtx).WithField(remoteSnapshotLogKey, prepareSucceeded).Debug("prepared remote snapshot")
-				return nil, errors.Wrapf(errdefs.ErrAlreadyExists, "target snapshot %q", target)
+				return nil, fmt.Errorf("target snapshot %q: %w", target, errdefs.ErrAlreadyExists)
 			}
 			log.G(lCtx).WithField(remoteSnapshotLogKey, prepareFailed).
-				WithError(err).Debug("failed to internally commit remote snapshot")
+				WithError(err).Warn("failed to internally commit remote snapshot")
 			// Don't fallback here (= prohibit to use this key again) because the FileSystem
 			// possible has done some work on this "upper" directory.
 			return nil, err
 		}
 	}
-
 	return o.mounts(ctx, s, parent)
 }
 
@@ -278,19 +300,24 @@ func (o *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 	s, err := storage.GetSnapshot(ctx, key)
 	t.Rollback()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get active mount")
+		return nil, fmt.Errorf("failed to get active mount: %w", err)
 	}
 	return o.mounts(ctx, s, key)
 }
 
 func (o *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
+	return o.commit(ctx, false, name, key, opts...)
+}
+
+func (o *snapshotter) commit(ctx context.Context, isRemote bool, name, key string, opts ...snapshots.Opt) error {
 	ctx, t, err := o.ms.TransactionContext(ctx, true)
 	if err != nil {
 		return err
 	}
 
+	rollback := true
 	defer func() {
-		if err != nil {
+		if rollback {
 			if rerr := t.Rollback(); rerr != nil {
 				log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
 			}
@@ -298,20 +325,24 @@ func (o *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	}()
 
 	// grab the existing id
-	id, _, _, err := storage.GetInfo(ctx, key)
+	id, _, usage, err := storage.GetInfo(ctx, key)
 	if err != nil {
 		return err
 	}
 
-	usage, err := fs.DiskUsage(ctx, o.upperPath(id))
-	if err != nil {
-		return err
+	if !isRemote { // skip diskusage for remote snapshots for allowing lazy preparation of nodes
+		du, err := fs.DiskUsage(ctx, o.upperPath(id))
+		if err != nil {
+			return err
+		}
+		usage = snapshots.Usage(du)
 	}
 
-	if _, err = storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
-		return errors.Wrap(err, "failed to commit snapshot")
+	if _, err = storage.CommitActive(ctx, key, name, usage, opts...); err != nil {
+		return fmt.Errorf("failed to commit snapshot: %w", err)
 	}
 
+	rollback = false
 	return t.Commit()
 }
 
@@ -333,7 +364,7 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 
 	_, _, err = storage.Remove(ctx, key)
 	if err != nil {
-		return errors.Wrap(err, "failed to remove")
+		return fmt.Errorf("failed to remove: %w", err)
 	}
 
 	if !o.asyncRemove {
@@ -341,7 +372,7 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		const cleanupCommitted = false
 		removals, err = o.getCleanupDirectories(ctx, t, cleanupCommitted)
 		if err != nil {
-			return errors.Wrap(err, "unable to get directories for removal")
+			return fmt.Errorf("unable to get directories for removal: %w", err)
 		}
 
 		// Remove directories after the transaction is closed, failures must not
@@ -424,10 +455,32 @@ func (o *snapshotter) getCleanupDirectories(ctx context.Context, t storage.Trans
 		return nil, err
 	}
 
+	remoteSnapshotNames := make(map[string]struct{})
+	{
+		keyToID := make(map[string]string, len(ids))
+		for id, key := range ids {
+			keyToID[key] = id
+		}
+		if err := storage.WalkInfo(ctx, func(ctx context.Context, info snapshots.Info) error {
+			if _, ok := info.Labels[remoteLabel]; ok {
+				if id, exists := keyToID[info.Name]; exists {
+					remoteSnapshotNames[id] = struct{}{}
+				}
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	cleanup := []string{}
 	for _, d := range dirs {
 		if !cleanupCommitted {
 			if _, ok := ids[d]; ok {
+				continue
+			}
+		} else {
+			if _, ok := remoteSnapshotNames[d]; !ok {
 				continue
 			}
 		}
@@ -448,7 +501,7 @@ func (o *snapshotter) cleanupSnapshotDirectory(ctx context.Context, dir string) 
 		log.G(ctx).WithError(err).WithField("dir", mp).Debug("failed to unmount")
 	}
 	if err := os.RemoveAll(dir); err != nil {
-		return errors.Wrapf(err, "failed to remove directory %q", dir)
+		return fmt.Errorf("failed to remove directory %q: %w", dir, err)
 	}
 	return nil
 }
@@ -470,7 +523,7 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 			if path != "" {
 				if err1 := o.cleanupSnapshotDirectory(ctx, path); err1 != nil {
 					log.G(ctx).WithError(err1).WithField("path", path).Error("failed to reclaim snapshot directory, directory may need removal")
-					err = errors.Wrapf(err, "failed to remove path: %v", err1)
+					err = fmt.Errorf("failed to remove path: %v: %w", err1, err)
 				}
 			}
 		}
@@ -482,7 +535,7 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		if rerr := t.Rollback(); rerr != nil {
 			log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
 		}
-		return storage.Snapshot{}, errors.Wrap(err, "failed to create prepare snapshot dir")
+		return storage.Snapshot{}, fmt.Errorf("failed to create prepare snapshot dir: %w", err)
 	}
 	rollback := true
 	defer func() {
@@ -495,13 +548,13 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 
 	s, err := storage.CreateSnapshot(ctx, kind, key, parent, opts...)
 	if err != nil {
-		return storage.Snapshot{}, errors.Wrap(err, "failed to create snapshot")
+		return storage.Snapshot{}, fmt.Errorf("failed to create snapshot: %w", err)
 	}
 
 	if len(s.ParentIDs) > 0 {
 		st, err := os.Stat(o.upperPath(s.ParentIDs[0]))
 		if err != nil {
-			return storage.Snapshot{}, errors.Wrap(err, "failed to stat parent")
+			return storage.Snapshot{}, fmt.Errorf("failed to stat parent: %w", err)
 		}
 
 		stat := st.Sys().(*syscall.Stat_t)
@@ -510,28 +563,28 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 			if rerr := t.Rollback(); rerr != nil {
 				log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
 			}
-			return storage.Snapshot{}, errors.Wrap(err, "failed to chown")
+			return storage.Snapshot{}, fmt.Errorf("failed to chown: %w", err)
 		}
 	}
 
 	path = filepath.Join(snapshotDir, s.ID)
 	if err = os.Rename(td, path); err != nil {
-		return storage.Snapshot{}, errors.Wrap(err, "failed to rename")
+		return storage.Snapshot{}, fmt.Errorf("failed to rename: %w", err)
 	}
 	td = ""
 
 	rollback = false
 	if err = t.Commit(); err != nil {
-		return storage.Snapshot{}, errors.Wrap(err, "commit failed")
+		return storage.Snapshot{}, fmt.Errorf("commit failed: %w", err)
 	}
 
 	return s, nil
 }
 
 func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, kind snapshots.Kind) (string, error) {
-	td, err := ioutil.TempDir(snapshotDir, "new-")
+	td, err := os.MkdirTemp(snapshotDir, "new-")
 	if err != nil {
-		return "", errors.Wrap(err, "failed to create temp dir")
+		return "", fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
 	if err := os.Mkdir(filepath.Join(td, "fs"), 0755); err != nil {
@@ -550,7 +603,7 @@ func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 func (o *snapshotter) mounts(ctx context.Context, s storage.Snapshot, checkKey string) ([]mount.Mount, error) {
 	// Make sure that all layers lower than the target layer are available
 	if checkKey != "" && !o.checkAvailability(ctx, checkKey) {
-		return nil, errors.Wrapf(errdefs.ErrUnavailable, "layer %q unavailable", s.ID)
+		return nil, fmt.Errorf("layer %q unavailable: %w", s.ID, errdefs.ErrUnavailable)
 	}
 
 	if len(s.ParentIDs) == 0 {
@@ -598,6 +651,9 @@ func (o *snapshotter) mounts(ctx context.Context, s storage.Snapshot, checkKey s
 	}
 
 	options = append(options, fmt.Sprintf("lowerdir=%s", strings.Join(parentPaths, ":")))
+	if o.userxattr {
+		options = append(options, "userxattr")
+	}
 	return []mount.Mount{
 		{
 			Type:    "overlay",
@@ -624,6 +680,7 @@ func (o *snapshotter) Close() error {
 	if err := o.cleanup(ctx, cleanupCommitted); err != nil {
 		log.G(ctx).WithError(err).Warn("failed to cleanup")
 	}
+
 	return o.ms.Close()
 }
 
@@ -640,18 +697,16 @@ func (o *snapshotter) prepareRemoteSnapshot(ctx context.Context, key string, lab
 		return err
 	}
 
-	if err := o.fs.Mount(ctx, o.upperPath(id), labels); err != nil {
-		return err
-	}
+	mountpoint := o.upperPath(id)
+	log.G(ctx).Infof("preparing filesystem mount at mountpoint=%v", mountpoint)
 
-	return nil
+	return o.fs.Mount(ctx, mountpoint, labels)
 }
 
 // checkAvailability checks avaiability of the specified layer and all lower
 // layers using filesystem's checking functionality.
 func (o *snapshotter) checkAvailability(ctx context.Context, key string) bool {
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("key", key))
-	log.G(ctx).Debug("checking layer availability")
+	log.G(ctx).WithField("key", key).Debug("checking layer availability")
 
 	ctx, t, err := o.ms.TransactionContext(ctx, false)
 	if err != nil {
@@ -690,6 +745,10 @@ func (o *snapshotter) checkAvailability(ctx context.Context, key string) bool {
 }
 
 func (o *snapshotter) restoreRemoteSnapshot(ctx context.Context) error {
+	if o.noRestore {
+		return nil
+	}
+
 	mounts, err := mountinfo.GetMounts(nil)
 	if err != nil {
 		return err
@@ -697,7 +756,7 @@ func (o *snapshotter) restoreRemoteSnapshot(ctx context.Context) error {
 	for _, m := range mounts {
 		if strings.HasPrefix(m.Mountpoint, filepath.Join(o.root, "snapshots")) {
 			if err := syscall.Unmount(m.Mountpoint, syscall.MNT_FORCE); err != nil {
-				return errors.Wrapf(err, "failed to unmount %s", m.Mountpoint)
+				return fmt.Errorf("failed to unmount %s: %w", m.Mountpoint, err)
 			}
 		}
 	}
@@ -712,8 +771,37 @@ func (o *snapshotter) restoreRemoteSnapshot(ctx context.Context) error {
 		return err
 	}
 	for _, info := range task {
+		// First, prepare the snapshot directory
+		if err := func() error {
+			ctx, t, err := o.ms.TransactionContext(ctx, false)
+			if err != nil {
+				return err
+			}
+			defer t.Rollback()
+			id, _, _, err := storage.GetInfo(ctx, info.Name)
+			if err != nil {
+				return err
+			}
+			if err := os.Mkdir(filepath.Join(o.root, "snapshots", id), 0700); err != nil && !os.IsExist(err) {
+				return err
+			}
+			if err := os.Mkdir(o.upperPath(id), 0755); err != nil && !os.IsExist(err) {
+				return err
+			}
+			return nil
+		}(); err != nil {
+			return fmt.Errorf("failed to create remote snapshot directory: %s: %w", info.Name, err)
+		}
 		if err := o.prepareRemoteSnapshot(ctx, info.Name, info.Labels); err != nil {
-			return errors.Wrapf(err, "failed to prepare remote snapshot: %s", info.Name)
+			if o.allowInvalidMountsOnRestart {
+				log.G(ctx).WithError(err).Warnf("failed to restore remote snapshot %s; remove this snapshot manually", info.Name)
+				// This snapshot mount is invalid but allow this.
+				// NOTE: snapshotter.Mount() will fail to return the mountpoint of these invalid snapshots so
+				//       containerd cannot use them anymore. User needs to manually remove the snapshots from
+				//       containerd's metadata store using ctr (e.g. `ctr snapshot rm`).
+				continue
+			}
+			return fmt.Errorf("failed to prepare remote snapshot: %s: %w", info.Name, err)
 		}
 	}
 

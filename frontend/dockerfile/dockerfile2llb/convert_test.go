@@ -1,16 +1,32 @@
 package dockerfile2llb
 
 import (
+	"bytes"
+	"maps"
 	"testing"
+	"time"
 
+	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
+	"github.com/moby/buildkit/frontend/dockerfile/linter"
+	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
+	"github.com/moby/buildkit/frontend/dockerui"
+	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/appcontext"
+	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
+	digest "github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func toEnvMap(args []instructions.KeyValuePairOptional, env []string) map[string]string {
-	m := shell.BuildEnvs(env)
+	envs := shell.EnvsFromSlice(env)
+	m := make(map[string]string)
+
+	for _, k := range envs.Keys() {
+		m[k], _ = envs.Get(k)
+	}
 
 	for _, arg := range args {
 		// If key already exists, keep previous value.
@@ -31,8 +47,8 @@ ENV FOO bar
 COPY f1 f2 /sub/
 RUN ls -l
 `
-	_, _, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
-	assert.NoError(t, err)
+	_, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.NoError(t, err)
 
 	df = `FROM scratch AS foo
 ENV FOO bar
@@ -40,8 +56,8 @@ FROM foo
 COPY --from=foo f1 /
 COPY --from=0 f2 /
 	`
-	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
-	assert.NoError(t, err)
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.NoError(t, err)
 
 	df = `FROM scratch AS foo
 ENV FOO bar
@@ -49,35 +65,110 @@ FROM foo
 COPY --from=foo f1 /
 COPY --from=0 f2 /
 	`
-	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{
-		Target: "Foo",
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{
+		Config: dockerui.Config{
+			Target: "Foo",
+		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{
-		Target: "nosuch",
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{
+		Config: dockerui.Config{
+			Target: "nosuch",
+		},
 	})
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	df = `FROM scratch
 	ADD http://github.com/moby/buildkit/blob/master/README.md /
 		`
-	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
-	assert.NoError(t, err)
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.NoError(t, err)
 
 	df = `FROM scratch
 	COPY http://github.com/moby/buildkit/blob/master/README.md /
 		`
-	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
-	assert.EqualError(t, err, "source can't be a URL for COPY")
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.EqualError(t, err, "source can't be a URL for COPY")
 
 	df = `FROM "" AS foo`
-	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
-	assert.Error(t, err)
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.Error(t, err)
 
 	df = `FROM ${BLANK} AS foo`
-	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
-	assert.Error(t, err)
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.Error(t, err)
+}
+
+func TestDockerfileParsingMarshal(t *testing.T) {
+	t.Parallel()
+	df := `FROM scratch
+ENV FOO bar
+COPY f1 f2 /sub/
+RUN ls -l
+`
+	res, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.NoError(t, err)
+
+	_, err = res.State.Marshal(t.Context())
+	require.NoError(t, err)
+}
+
+func TestRunCustomNameKeepsEscapes(t *testing.T) {
+	t.Parallel()
+	df := `FROM scratch
+ENV FOO=bar
+RUN echo C:\hello\world\path
+RUN echo "C:\hello\quoted\path"
+RUN echo \$FOO $FOO "a\"b"
+RUN ["echo", "C:\\exec\\path"]
+`
+	assert.ElementsMatch(t, []string{
+		`[1/4] RUN echo C:\hello\world\path`,
+		`[2/4] RUN echo "C:\hello\quoted\path"`,
+		`[3/4] RUN echo \$FOO bar "a\"b"`,
+		`[4/4] RUN ["echo", "C:\\exec\\path"]`,
+	}, customNames(t, df))
+
+	df = "# escape=`\nFROM scratch\nENV FOO=bar\nRUN echo C:\\hello `$FOO $FOO\n"
+	assert.ElementsMatch(t, []string{
+		"[1/1] RUN echo C:\\hello `$FOO bar",
+	}, customNames(t, df))
+}
+
+func customNames(t *testing.T, df string) []string {
+	t.Helper()
+	res, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.NoError(t, err)
+
+	def, err := res.State.Marshal(t.Context())
+	require.NoError(t, err)
+
+	var names []string
+	for _, md := range def.Metadata {
+		if name, ok := md.Description["llb.customname"]; ok {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func TestCopyFromKeepsStageLabels(t *testing.T) {
+	t.Parallel()
+
+	df := `FROM scratch AS base
+LABEL marker=base
+
+FROM base AS sibling
+LABEL marker=sibling
+
+FROM base AS consumer
+COPY --from=sibling / /
+`
+
+	res, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.NoError(t, err)
+	require.Equal(t, "base", res.Image.Config.Labels["marker"])
 }
 
 func TestAddEnv(t *testing.T) {
@@ -125,48 +216,71 @@ func TestToEnvList(t *testing.T) {
 	v := "val2"
 	args := []instructions.KeyValuePairOptional{{Key: "key2", Value: &v}}
 	env := []string{"key1=val1"}
-	resutl := toEnvMap(args, env)
-	assert.Equal(t, map[string]string{"key1": "val1", "key2": "val2"}, resutl)
+	result := toEnvMap(args, env)
+	assert.Equal(t, map[string]string{"key1": "val1", "key2": "val2"}, result)
 
 	// value of args is nil
 	args = []instructions.KeyValuePairOptional{{Key: "key2", Value: nil}}
 	env = []string{"key1=val1"}
-	resutl = toEnvMap(args, env)
-	assert.Equal(t, map[string]string{"key1": "val1"}, resutl)
+	result = toEnvMap(args, env)
+	assert.Equal(t, map[string]string{"key1": "val1"}, result)
 
 	// args has duplicated key with env
 	v = "val2"
 	args = []instructions.KeyValuePairOptional{{Key: "key1", Value: &v}}
 	env = []string{"key1=val1"}
-	resutl = toEnvMap(args, env)
-	assert.Equal(t, map[string]string{"key1": "val1"}, resutl)
+	result = toEnvMap(args, env)
+	assert.Equal(t, map[string]string{"key1": "val1"}, result)
 
 	v = "val2"
 	args = []instructions.KeyValuePairOptional{{Key: "key1", Value: &v}}
 	env = []string{"key1="}
-	resutl = toEnvMap(args, env)
-	assert.Equal(t, map[string]string{"key1": ""}, resutl)
+	result = toEnvMap(args, env)
+	assert.Equal(t, map[string]string{"key1": ""}, result)
 
 	v = "val2"
 	args = []instructions.KeyValuePairOptional{{Key: "key1", Value: &v}}
 	env = []string{"key1"}
-	resutl = toEnvMap(args, env)
-	assert.Equal(t, map[string]string{"key1": ""}, resutl)
+	result = toEnvMap(args, env)
+	assert.Equal(t, map[string]string{"key1": ""}, result)
 
 	// env has duplicated keys
 	v = "val2"
 	args = []instructions.KeyValuePairOptional{{Key: "key2", Value: &v}}
 	env = []string{"key1=val1", "key1=val1_2"}
-	resutl = toEnvMap(args, env)
-	assert.Equal(t, map[string]string{"key1": "val1_2", "key2": "val2"}, resutl)
+	result = toEnvMap(args, env)
+	assert.Equal(t, map[string]string{"key1": "val1_2", "key2": "val2"}, result)
 
 	// args has duplicated keys
 	v1 := "v1"
 	v2 := "v2"
 	args = []instructions.KeyValuePairOptional{{Key: "key2", Value: &v1}, {Key: "key2", Value: &v2}}
 	env = []string{"key1=val1"}
-	resutl = toEnvMap(args, env)
-	assert.Equal(t, map[string]string{"key1": "val1", "key2": "v1"}, resutl)
+	result = toEnvMap(args, env)
+	assert.Equal(t, map[string]string{"key1": "val1", "key2": "v1"}, result)
+}
+
+func TestProxyEnvFromBuildArgsDeterministicOrder(t *testing.T) {
+	pe := proxyEnvFromBuildArgs(map[string]string{
+		"ALL_PROXY":  "all-upper",
+		"all_proxy":  "all-lower",
+		"HTTP_PROXY": "http-upper",
+		"http_proxy": "http-lower",
+		"NO_PROXY":   "no-proxy",
+	})
+	require.NotNil(t, pe)
+	require.Equal(t, &llb.ProxyEnv{
+		HTTPProxy: "http-lower",
+		NoProxy:   "no-proxy",
+		AllProxy:  "all-lower",
+	}, pe)
+}
+
+func TestProxyEnvFromBuildArgsNilWhenNoProxyArgs(t *testing.T) {
+	pe := proxyEnvFromBuildArgs(map[string]string{
+		"FOO": "bar",
+	})
+	require.Nil(t, pe)
 }
 
 func TestDockerfileCircularDependencies(t *testing.T) {
@@ -174,8 +288,8 @@ func TestDockerfileCircularDependencies(t *testing.T) {
 	df := `FROM busybox AS stage0
 COPY --from=stage0 f1 /sub/
 `
-	_, _, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
-	assert.EqualError(t, err, "circular dependency detected on stage: stage0")
+	_, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.EqualError(t, err, "circular dependency detected on stage: stage0")
 
 	// multiple stages with circular dependency
 	df = `FROM busybox AS stage0
@@ -185,6 +299,274 @@ COPY --from=stage0 f2 /sub/
 FROM busybox AS stage2
 COPY --from=stage1 f2 /sub/
 `
-	_, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
-	assert.EqualError(t, err, "circular dependency detected on stage: stage0")
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.EqualError(t, err, "circular dependency detected on stage: stage0")
+}
+
+func TestBaseImageConfig(t *testing.T) {
+	df := `FROM --platform=linux/amd64 busybox:1.36.1@sha256:6d9ac9237a84afe1516540f40a0fafdc86859b2141954b4d643af7066d598b74 AS foo
+RUN echo foo
+
+# the source image of bar is busybox, not foo
+FROM foo AS bar
+RUN echo bar
+`
+	res, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.NoError(t, err)
+	t.Logf("baseImg=%+v", res.BaseImage)
+	assert.Equal(t, []digest.Digest{"sha256:2e112031b4b923a873c8b3d685d48037e4d5ccd967b658743d93a6e56c3064b9"}, res.BaseImage.RootFS.DiffIDs)
+	assert.Equal(t, "2024-01-17 21:49:12 +0000 UTC", res.BaseImage.Created.String())
+}
+
+func TestDispatchHealthcheckHistory(t *testing.T) {
+	hc := &instructions.HealthCheckCommand{
+		Health: &dockerspec.HealthcheckConfig{
+			Test:          []string{"bin", "-c", "exit 0"},
+			Interval:      1 * time.Second,
+			Timeout:       10 * time.Second,
+			StartPeriod:   3 * time.Second,
+			StartInterval: 100 * time.Millisecond,
+			Retries:       5,
+		},
+	}
+
+	d := &dispatchState{}
+	err := dispatchHealthcheck(d, hc, &linter.Linter{})
+	require.NoError(t, err)
+	want := `HEALTHCHECK {Test:[bin -c exit 0] Interval:1s Timeout:10s StartPeriod:3s StartInterval:100ms Retries:5}`
+	require.Equal(t, want, d.image.History[0].CreatedBy)
+}
+
+func TestResolveSourceDateEpochValue(t *testing.T) {
+	t.Parallel()
+
+	globalArgs := &llb.EnvList{}
+	shlex := shell.NewLex('\\')
+
+	tm, err := resolveSourceDateEpochValue(t.Context(), "1700000501", ConvertOpt{}, nil, globalArgs, shlex)
+	require.NoError(t, err)
+	require.NotNil(t, tm)
+	assert.Equal(t, time.Unix(1700000501, 0).UTC(), *tm)
+	assert.Equal(t, "1700000501", formatSourceDateEpochValue(tm))
+
+	tm, err = resolveSourceDateEpochValue(t.Context(), "context", ConvertOpt{}, nil, globalArgs, shlex)
+	require.NoError(t, err)
+	assert.Nil(t, tm)
+	assert.Empty(t, formatSourceDateEpochValue(tm))
+
+	_, err = resolveSourceDateEpochValue(t.Context(), "not-a-timestamp", ConvertOpt{}, nil, globalArgs, shlex)
+	require.ErrorContains(t, err, "invalid SOURCE_DATE_EPOCH")
+}
+
+func TestResolveSourceDateEpochValueStageInvalid(t *testing.T) {
+	t.Parallel()
+
+	df := []byte(`
+ARG SOURCE_DATE_EPOCH=mysource
+FROM scratch AS mysource
+COPY Dockerfile /Dockerfile
+FROM scratch
+`)
+
+	parsed, err := parser.Parse(bytes.NewReader(df))
+	require.NoError(t, err)
+
+	stages, _, err := instructions.Parse(parsed.AST, nil)
+	require.NoError(t, err)
+
+	globalArgs := (&llb.EnvList{}).AddOrReplace("SOURCE_DATE_EPOCH", "mysource")
+	_, err = resolveSourceDateEpochValue(t.Context(), "mysource", ConvertOpt{}, stages, globalArgs, shell.NewLex('\\'))
+	require.ErrorContains(t, err, "SOURCE_DATE_EPOCH stage does not meet source-only requirements")
+}
+
+func TestSourceDateEpochStageSourceHTTP(t *testing.T) {
+	t.Parallel()
+
+	df := []byte(`
+FROM scratch AS mysource
+ARG URL=https://example.com/src.tar
+ADD $URL /
+`)
+
+	parsed, err := parser.Parse(bytes.NewReader(df))
+	require.NoError(t, err)
+
+	stages, _, err := instructions.Parse(parsed.AST, nil)
+	require.NoError(t, err)
+	require.Len(t, stages, 1)
+
+	state, err := sourceDateEpochStageSource(stages[0], nil, &llb.EnvList{}, shell.NewLex('\\'), false, false)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	sourceOp, err := sourceOpFromState(t.Context(), state)
+	require.NoError(t, err)
+	require.NotNil(t, sourceOp)
+	assert.Equal(t, "src.tar", sourceOp.Attrs["http.filename"])
+}
+
+func TestDockerfileGitOptionsADD(t *testing.T) {
+	t.Parallel()
+
+	df := []byte(`
+FROM scratch
+ADD https://github.com/moby/buildkit.git#master /
+`)
+
+	for _, tc := range []struct {
+		name             string
+		gitAdvice        bool
+		gitDebugCommands bool
+	}{
+		{
+			name: "default",
+		},
+		{
+			name:      "advice",
+			gitAdvice: true,
+		},
+		{
+			name:             "debug commands",
+			gitDebugCommands: true,
+		},
+		{
+			name:             "advice and debug commands",
+			gitAdvice:        true,
+			gitDebugCommands: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := Dockerfile2LLB(appcontext.Context(), df, ConvertOpt{
+				Config: dockerui.Config{
+					GitAdvice:        tc.gitAdvice,
+					GitDebugCommands: tc.gitDebugCommands,
+				},
+			})
+			require.NoError(t, err)
+
+			sourceOp, err := sourceOpFromState(t.Context(), &res.State)
+			require.NoError(t, err)
+			require.NotNil(t, sourceOp)
+
+			parsed, err := parser.Parse(bytes.NewReader(df))
+			require.NoError(t, err)
+			stages, _, err := instructions.Parse(parsed.AST, nil)
+			require.NoError(t, err)
+			epochState, err := sourceDateEpochStageSource(stages[0], nil, &llb.EnvList{}, shell.NewLex('\\'), tc.gitAdvice, tc.gitDebugCommands)
+			require.NoError(t, err)
+			epochOp, err := sourceOpFromState(t.Context(), epochState)
+			require.NoError(t, err)
+			require.NotNil(t, epochOp)
+			for _, op := range []*pb.SourceOp{sourceOp, epochOp} {
+				for attr, enabled := range map[string]bool{
+					pb.AttrGitAdvice:        tc.gitAdvice,
+					pb.AttrGitDebugCommands: tc.gitDebugCommands,
+				} {
+					if enabled {
+						require.Equal(t, "true", op.Attrs[attr])
+					} else {
+						require.NotContains(t, op.Attrs, attr)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestSourceDateEpochStageSourceRequiresScratch(t *testing.T) {
+	t.Parallel()
+
+	df := []byte(`
+FROM busybox AS mysource
+ADD https://example.com/src.tar /
+`)
+
+	parsed, err := parser.Parse(bytes.NewReader(df))
+	require.NoError(t, err)
+
+	stages, _, err := instructions.Parse(parsed.AST, nil)
+	require.NoError(t, err)
+	require.Len(t, stages, 1)
+
+	_, err = sourceDateEpochStageSource(stages[0], nil, &llb.EnvList{}, shell.NewLex('\\'), false, false)
+	require.ErrorContains(t, err, "SOURCE_DATE_EPOCH stage must use FROM scratch")
+}
+
+func TestSourceOpFromStateWrappedCopy(t *testing.T) {
+	t.Parallel()
+
+	st := llb.Scratch().File(llb.Copy(llb.HTTP("https://example.com/src.tar"), "src.tar", "/foo"))
+
+	sourceOp, err := sourceOpFromState(t.Context(), &st)
+	require.NoError(t, err)
+	require.NotNil(t, sourceOp)
+	assert.Equal(t, "https://example.com/src.tar", sourceOp.Identifier)
+}
+
+func TestSourceOpFromStateMultipleSourcesIgnored(t *testing.T) {
+	t.Parallel()
+
+	st := llb.Scratch().
+		File(llb.Copy(llb.HTTP("https://example.com/src1.tar"), "src1.tar", "/foo")).
+		File(llb.Copy(llb.HTTP("https://example.com/src2.tar"), "src2.tar", "/bar"))
+
+	sourceOp, err := sourceOpFromState(t.Context(), &st)
+	require.NoError(t, err)
+	assert.Nil(t, sourceOp)
+}
+
+func TestSourceStateFromSourceOpWrappedCopy(t *testing.T) {
+	t.Parallel()
+
+	st := llb.Scratch().File(llb.Copy(llb.HTTP("https://example.com/src.tar", llb.Filename("src.tar")), "src.tar", "/foo"))
+
+	sourceOp, err := sourceOpFromState(t.Context(), &st)
+	require.NoError(t, err)
+	require.NotNil(t, sourceOp)
+
+	sourceState := llb.NewState(llb.NewSource(sourceOp.Identifier, maps.Clone(sourceOp.Attrs), llb.Constraints{}).Output())
+	rewrittenSourceOp, err := sourceOpFromState(t.Context(), &sourceState)
+	require.NoError(t, err)
+	require.NotNil(t, rewrittenSourceOp)
+	assert.Equal(t, sourceOp.Identifier, rewrittenSourceOp.Identifier)
+	assert.Equal(t, sourceOp.Attrs, rewrittenSourceOp.Attrs)
+}
+
+func TestCopyLinkChownByName(t *testing.T) {
+	t.Parallel()
+
+	caps := pb.Caps.CapSet(pb.Caps.All())
+
+	for _, tc := range []struct {
+		name    string
+		flags   string
+		mergeOp bool
+		err     string
+	}{
+		{name: "numeric", flags: "--link --chown=1000:1000", mergeOp: true},
+		{name: "root", flags: "--link --chown=root:root", mergeOp: true},
+		{name: "user name", flags: "--link --chown=foo", mergeOp: true, err: "--chown=foo"},
+		{name: "user and group names", flags: "--link --chown=foo:bar", mergeOp: true, err: "--chown=foo:bar"},
+		{name: "group name", flags: "--link --chown=1000:bar", mergeOp: true, err: "--chown=1000:bar"},
+		{name: "user name without merge op", flags: "--link --chown=foo:bar", err: "--chown=foo:bar"},
+		{name: "user name with chmod", flags: "--link --chmod=644 --chown=foo:bar", mergeOp: true, err: "--chown=foo:bar"},
+		{name: "user name without link", flags: "--chown=foo:bar", mergeOp: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			df := "FROM scratch\nCOPY " + tc.flags + " a /b\n"
+			opt := ConvertOpt{}
+			if tc.mergeOp {
+				opt.LLBCaps = &caps
+			}
+			_, err := Dockerfile2LLB(appcontext.Context(), []byte(df), opt)
+			if tc.err == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.err)
+			require.ErrorContains(t, err, "--link")
+		})
+	}
 }

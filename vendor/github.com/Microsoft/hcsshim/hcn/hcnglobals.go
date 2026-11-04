@@ -1,3 +1,5 @@
+//go:build windows
+
 package hcn
 
 import (
@@ -53,10 +55,9 @@ var (
 	}
 	// HNS 12.0 allows for session affinity for loadbalancing
 	SessionAffinityVersion = VersionRanges{VersionRange{MinVersion: Version{Major: 12, Minor: 0}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}}}
-	// HNS 10.5 through 11 (not included) and 12.0+ supports Ipv6 dual stack.
+	// HNS 11.10+ supports Ipv6 dual stack.
 	IPv6DualStackVersion = VersionRanges{
-		VersionRange{MinVersion: Version{Major: 10, Minor: 5}, MaxVersion: Version{Major: 10, Minor: math.MaxInt32}},
-		VersionRange{MinVersion: Version{Major: 12, Minor: 0}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}},
+		VersionRange{MinVersion: Version{Major: 11, Minor: 10}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}},
 	}
 	// HNS 13.0 allows for Set Policy support
 	SetPolicyVersion = VersionRanges{VersionRange{MinVersion: Version{Major: 13, Minor: 0}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}}}
@@ -74,6 +75,22 @@ var (
 
 	//HNS 13.2 allows for L4WfpProxy Policy support
 	L4WfpProxyPolicyVersion = VersionRanges{VersionRange{MinVersion: Version{Major: 13, Minor: 2}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}}}
+
+	//HNS 14.0 allows for TierAcl Policy support
+	TierAclPolicyVersion = VersionRanges{VersionRange{MinVersion: Version{Major: 14, Minor: 0}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}}}
+
+	//HNS 15.0 allows for NetworkACL Policy support
+	NetworkACLPolicyVersion = VersionRanges{VersionRange{MinVersion: Version{Major: 15, Minor: 0}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}}}
+
+	//HNS 15.0 allows for NestedIpSet support
+	NestedIpSetVersion = VersionRanges{VersionRange{MinVersion: Version{Major: 15, Minor: 0}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}}}
+
+	//HNS 15.1 allows support for DisableHostPort flag.
+	DisableHostPortVersion = VersionRanges{VersionRange{MinVersion: Version{Major: 15, Minor: 1}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}}}
+	// HNS 15.4 allows for Modify Loadbalancer support
+	ModifyLoadbalancerVersion = VersionRanges{VersionRange{MinVersion: Version{Major: 15, Minor: 4}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}}}
+	// HNS 15.4 allows for Accelnet support
+	AccelnetVersion = VersionRanges{VersionRange{MinVersion: Version{Major: 15, Minor: 4}, MaxVersion: Version{Major: math.MaxInt32, Minor: math.MaxInt32}}}
 )
 
 // GetGlobals returns the global properties of the HCN Service.
@@ -103,7 +120,7 @@ func hnsCall(method, path, request string, returnResponse interface{}) error {
 
 	err := _hnsCall(method, path, request, &responseBuffer)
 	if err != nil {
-		return hcserror.New(err, "hnsCall ", "")
+		return hcserror.New(err, "hnsCall", "")
 	}
 	response := interop.ConvertAndFreeCoTaskMemString(responseBuffer)
 

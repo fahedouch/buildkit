@@ -8,13 +8,13 @@ package fuse
 const pollHackName = ".go-fuse-epoll-hack"
 const pollHackInode = ^uint64(0)
 
-func doPollHackLookup(ms *Server, req *request) {
+func doPollHackLookup(ms *protocolServer, req *request) {
 	attr := Attr{
 		Ino:   pollHackInode,
 		Mode:  S_IFREG | 0644,
 		Nlink: 1,
 	}
-	switch req.inHeader.Opcode {
+	switch req.inHeader().Opcode {
 	case _OP_LOOKUP:
 		out := (*EntryOut)(req.outData())
 		*out = EntryOut{
@@ -28,10 +28,13 @@ func doPollHackLookup(ms *Server, req *request) {
 			Fh: pollHackInode,
 		}
 		req.status = OK
-	case _OP_GETATTR:
+	case _OP_GETATTR, _OP_SETATTR:
 		out := (*AttrOut)(req.outData())
 		out.Attr = attr
 		req.status = OK
+	case _OP_GETXATTR:
+		// Kernel will try to read acl xattrs. Pretend we don't have any.
+		req.status = ENODATA
 	case _OP_POLL:
 		req.status = ENOSYS
 

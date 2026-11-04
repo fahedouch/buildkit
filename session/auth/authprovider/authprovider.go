@@ -5,23 +5,28 @@ import (
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/json"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	authutil "github.com/containerd/containerd/remotes/docker/auth"
-	remoteserrors "github.com/containerd/containerd/remotes/errors"
+	authutil "github.com/containerd/containerd/v2/core/remotes/docker/auth"
+	remoteserrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	"github.com/docker/cli/cli/config"
-	"github.com/docker/cli/cli/config/configfile"
+	"github.com/docker/cli/cli/config/types"
+	cleanhttp "github.com/hashicorp/go-cleanhttp"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/auth"
+	"github.com/moby/buildkit/util/errutil"
 	"github.com/moby/buildkit/util/progress/progresswriter"
+	"github.com/moby/buildkit/util/resolver/retryhandler"
+	"github.com/moby/buildkit/util/tracing"
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/nacl/sign"
 	"google.golang.org/grpc"
@@ -29,19 +34,52 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func NewDockerAuthProvider(stderr io.Writer) session.Attachable {
+const (
+	defaultExpiration      = 60
+	DockerHubConfigfileKey = "https://index.docker.io/v1/"
+	DockerHubRegistryHost  = "registry-1.docker.io"
+)
+
+type AuthConfigProvider func(ctx context.Context, host string, scope []string, cacheCheck ExpireCachedAuthCheck) (types.AuthConfig, error)
+
+type ExpireCachedAuthCheck func(created time.Time, serverURL string) bool
+
+type DockerAuthProviderConfig struct {
+	// AuthConfigProvider is a function that provides auth config for a given host and scope
+	AuthConfigProvider AuthConfigProvider
+	// TLSConfigs is a map of host to TLS config
+	TLSConfigs map[string]*AuthTLSConfig
+	// ExpireCachedAuth is a function that returns true auth config should be refreshed
+	// instead of using a pre-cached result.
+	// If nil then the cached result will expire after 4 minutes and 50 seconds.
+	// The function is called with the time the cached auth config was created
+	// and the server URL the auth config is for.
+	ExpireCachedAuth ExpireCachedAuthCheck
+}
+
+func NewDockerAuthProvider(cfg DockerAuthProviderConfig) session.Attachable {
+	if cfg.ExpireCachedAuth == nil {
+		cfg.ExpireCachedAuth = func(created time.Time, _ string) bool {
+			// Tokens for Google Artifact Registry via Workload Identity expire after 5 minutes.
+			return time.Since(created) > 4*time.Minute+50*time.Second
+		}
+	}
 	return &authProvider{
-		config:      config.LoadDefaultConfigFile(stderr),
+		expireAc:    cfg.ExpireCachedAuth,
+		provider:    cfg.AuthConfigProvider,
 		seeds:       &tokenSeeds{dir: config.Dir()},
 		loggerCache: map[string]struct{}{},
+		tlsConfigs:  cfg.TLSConfigs,
 	}
 }
 
 type authProvider struct {
-	config      *configfile.ConfigFile
+	expireAc    func(time.Time, string) bool
+	provider    AuthConfigProvider
 	seeds       *tokenSeeds
 	logger      progresswriter.Logger
 	loggerCache map[string]struct{}
+	tlsConfigs  map[string]*AuthTLSConfig
 
 	// The need for this mutex is not well understood.
 	// Without it, the docker cli on OS X hangs when
@@ -60,12 +98,56 @@ func (ap *authProvider) Register(server *grpc.Server) {
 	auth.RegisterAuthServer(server, ap)
 }
 
-func (ap *authProvider) FetchToken(ctx context.Context, req *auth.FetchTokenRequest) (rr *auth.FetchTokenResponse, err error) {
-	creds, err := ap.credentials(req.Host)
+func (ap *authProvider) FetchToken(ctx context.Context, req *auth.FetchTokenRequest) (_ *auth.FetchTokenResponse, err error) {
+	ac, err := ap.getAuthConfig(ctx, req.Host, req.Scopes, ap.expireAc)
 	if err != nil {
 		return nil, err
 	}
 
+	// Format registry errors only after deciding whether to refresh. WithDetails
+	// can replace the HTTP status with a structured registry error.
+	defer func() {
+		if toCredentials(*ac).Secret != "" {
+			err = errors.Wrap(errutil.WithDetails(err), "failed to fetch oauth token")
+		} else {
+			err = errors.Wrap(err, "failed to fetch anonymous token")
+		}
+	}()
+
+	resp, err := ap.fetchToken(ctx, req, ac)
+	creds := toCredentials(*ac)
+	var statusErr remoteserrors.ErrUnexpectedStatus
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusUnauthorized || creds.Secret == "" {
+		return resp, err
+	}
+
+	// Helpers can return credentials that expire before the cache TTL. After
+	// both token request methods fail, reload once without changing the normal
+	// expiration policy used by other requests.
+	refreshed, refreshErr := ap.getAuthConfig(ctx, req.Host, req.Scopes, func(time.Time, string) bool {
+		return true
+	})
+	if refreshErr != nil {
+		return nil, refreshErr
+	}
+	newCreds := toCredentials(*refreshed)
+	if newCreds.Username == creds.Username && newCreds.Secret == creds.Secret && refreshed.RegistryToken == ac.RegistryToken {
+		return nil, err
+	}
+	ac = refreshed
+
+	return ap.fetchToken(ctx, req, ac)
+}
+
+// fetchToken performs a token exchange with the supplied credentials, including
+// the GET fallback for registries that do not support OAuth POST requests.
+func (ap *authProvider) fetchToken(ctx context.Context, req *auth.FetchTokenRequest, ac *types.AuthConfig) (rr *auth.FetchTokenResponse, err error) {
+	// check for statically configured bearer token
+	if ac.RegistryToken != "" {
+		return toTokenResponse(ac.RegistryToken, time.Time{}, 0), nil
+	}
+
+	creds := toCredentials(*ac)
 	to := authutil.TokenOptions{
 		Realm:    req.Realm,
 		Service:  req.Service,
@@ -74,59 +156,100 @@ func (ap *authProvider) FetchToken(ctx context.Context, req *auth.FetchTokenRequ
 		Secret:   creds.Secret,
 	}
 
+	httpClient := tracing.DefaultClient
+	if tc, err := ap.tlsConfig(req.Host); err == nil && tc != nil {
+		transport := cleanhttp.DefaultTransport()
+		transport.TLSClientConfig = tc
+		httpClient.Transport = tracing.NewTransport(transport)
+	}
+
 	if creds.Secret != "" {
 		done := func(progresswriter.SubLogger) error {
 			return err
 		}
-		defer func() {
-			err = errors.Wrap(err, "failed to fetch oauth token")
-		}()
 		ap.mu.Lock()
 		name := fmt.Sprintf("[auth] %v token for %s", strings.Join(trimScopePrefix(req.Scopes), " "), req.Host)
 		if _, ok := ap.loggerCache[name]; !ok {
 			progresswriter.Wrap(name, ap.logger, done)
 		}
 		ap.mu.Unlock()
-		// try GET first because Docker Hub does not support POST
-		// switch once support has landed
-		resp, err := authutil.FetchToken(ctx, http.DefaultClient, nil, to)
+		// credential information is provided, use oauth POST endpoint
+		resp, err := retryhandler.WithRetry(ctx, nil, func(ctx context.Context) (*authutil.OAuthTokenResponse, error) {
+			return authutil.FetchTokenWithOAuth(ctx, httpClient, nil, "buildkit-client", to)
+		})
 		if err != nil {
 			var errStatus remoteserrors.ErrUnexpectedStatus
 			if errors.As(err, &errStatus) {
-				// retry with POST request
+				// Registries without support for POST may return 404 for POST /v2/token.
 				// As of September 2017, GCR is known to return 404.
 				// As of February 2018, JFrog Artifactory is known to return 401.
-				if (errStatus.StatusCode == 405 && to.Username != "") || errStatus.StatusCode == 404 || errStatus.StatusCode == 401 {
-					resp, err := authutil.FetchTokenWithOAuth(ctx, http.DefaultClient, nil, "buildkit-client", to)
+				if (errStatus.StatusCode == http.StatusMethodNotAllowed && to.Username != "") || errStatus.StatusCode == http.StatusNotFound || errStatus.StatusCode == http.StatusUnauthorized {
+					resp, err := retryhandler.WithRetry(ctx, nil, func(ctx context.Context) (*authutil.FetchTokenResponse, error) {
+						return authutil.FetchToken(ctx, httpClient, nil, to)
+					})
 					if err != nil {
 						return nil, err
 					}
-
-					return toTokenResponse(resp.AccessToken, resp.IssuedAt, resp.ExpiresIn), nil
+					return toTokenResponse(resp.Token, resp.IssuedAt, resp.ExpiresInSeconds), nil
 				}
 			}
 			return nil, err
 		}
-		return toTokenResponse(resp.Token, resp.IssuedAt, resp.ExpiresIn), nil
+		return toTokenResponse(resp.AccessToken, resp.IssuedAt, resp.ExpiresInSeconds), nil
 	}
 	// do request anonymously
-	resp, err := authutil.FetchToken(ctx, http.DefaultClient, nil, to)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to fetch anonymous token")
-	}
-	return toTokenResponse(resp.Token, resp.IssuedAt, resp.ExpiresIn), nil
-}
-
-func (ap *authProvider) credentials(host string) (*auth.CredentialsResponse, error) {
-	ap.mu.Lock()
-	defer ap.mu.Unlock()
-	if host == "registry-1.docker.io" {
-		host = "https://index.docker.io/v1/"
-	}
-	ac, err := ap.config.GetAuthConfig(host)
+	resp, err := retryhandler.WithRetry(ctx, nil, func(ctx context.Context) (*authutil.FetchTokenResponse, error) {
+		return authutil.FetchToken(ctx, httpClient, nil, to)
+	})
 	if err != nil {
 		return nil, err
 	}
+	return toTokenResponse(resp.Token, resp.IssuedAt, resp.ExpiresInSeconds), nil
+}
+
+func (ap *authProvider) tlsConfig(host string) (*tls.Config, error) {
+	if ap.tlsConfigs == nil {
+		return nil, nil
+	}
+	c, ok := ap.tlsConfigs[host]
+	if !ok {
+		return nil, nil
+	}
+	tc := &tls.Config{}
+	if len(c.RootCAs) > 0 {
+		systemPool, err := x509.SystemCertPool()
+		if err != nil {
+			if runtime.GOOS == "windows" {
+				systemPool = x509.NewCertPool()
+			} else {
+				return nil, errors.Wrapf(err, "unable to get system cert pool")
+			}
+		}
+		tc.RootCAs = systemPool
+	}
+
+	for _, p := range c.RootCAs {
+		dt, err := os.ReadFile(p)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to read %s", p)
+		}
+		tc.RootCAs.AppendCertsFromPEM(dt)
+	}
+
+	for _, kp := range c.KeyPairs {
+		cert, err := tls.LoadX509KeyPair(kp.Certificate, kp.Key)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to load keypair for %s", kp.Certificate)
+		}
+		tc.Certificates = append(tc.Certificates, cert)
+	}
+	if c.Insecure {
+		tc.InsecureSkipVerify = true
+	}
+	return tc, nil
+}
+
+func toCredentials(ac types.AuthConfig) *auth.CredentialsResponse {
 	res := &auth.CredentialsResponse{}
 	if ac.IdentityToken != "" {
 		res.Secret = ac.IdentityToken
@@ -134,17 +257,21 @@ func (ap *authProvider) credentials(host string) (*auth.CredentialsResponse, err
 		res.Username = ac.Username
 		res.Secret = ac.Password
 	}
-	return res, nil
+	return res
 }
 
 func (ap *authProvider) Credentials(ctx context.Context, req *auth.CredentialsRequest) (*auth.CredentialsResponse, error) {
-	resp, err := ap.credentials(req.Host)
-	if err != nil || resp.Secret != "" {
+	ac, err := ap.getAuthConfig(ctx, req.Host, nil, ap.expireAc)
+	if err != nil {
+		return nil, err
+	}
+	resp := toCredentials(*ac)
+	if resp.Secret != "" {
 		ap.mu.Lock()
 		defer ap.mu.Unlock()
 		_, ok := ap.loggerCache[req.Host]
 		ap.loggerCache[req.Host] = struct{}{}
-		if !ok {
+		if !ok && ap.logger != nil {
 			return resp, progresswriter.Wrap(fmt.Sprintf("[auth] sharing credentials for %s", req.Host), ap.logger, func(progresswriter.SubLogger) error {
 				return err
 			})
@@ -154,7 +281,7 @@ func (ap *authProvider) Credentials(ctx context.Context, req *auth.CredentialsRe
 }
 
 func (ap *authProvider) GetTokenAuthority(ctx context.Context, req *auth.GetTokenAuthorityRequest) (*auth.GetTokenAuthorityResponse, error) {
-	key, err := ap.getAuthorityKey(req.Host, req.Salt)
+	key, err := ap.getAuthorityKey(ctx, req.Host, req.Salt)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +290,7 @@ func (ap *authProvider) GetTokenAuthority(ctx context.Context, req *auth.GetToke
 }
 
 func (ap *authProvider) VerifyTokenAuthority(ctx context.Context, req *auth.VerifyTokenAuthorityRequest) (*auth.VerifyTokenAuthorityResponse, error) {
-	key, err := ap.getAuthorityKey(req.Host, req.Salt)
+	key, err := ap.getAuthorityKey(ctx, req.Host, req.Salt)
 	if err != nil {
 		return nil, err
 	}
@@ -174,15 +301,35 @@ func (ap *authProvider) VerifyTokenAuthority(ctx context.Context, req *auth.Veri
 	return &auth.VerifyTokenAuthorityResponse{Signed: sign.Sign(nil, req.Payload, priv)}, nil
 }
 
-func (ap *authProvider) getAuthorityKey(host string, salt []byte) (ed25519.PrivateKey, error) {
+func (ap *authProvider) getAuthConfig(ctx context.Context, host string, scopes []string, expireCheck ExpireCachedAuthCheck) (*types.AuthConfig, error) {
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+
+	var ac types.AuthConfig
+	if ap.provider != nil {
+		span, _ := tracing.StartSpan(ctx, fmt.Sprintf("load credentials for %s", host))
+		res, err := ap.provider(ctx, host, scopes, expireCheck)
+		tracing.FinishWithError(span, err)
+		if err != nil {
+			return nil, err
+		}
+		ac = res
+	}
+
+	return &ac, nil
+}
+
+func (ap *authProvider) getAuthorityKey(ctx context.Context, host string, salt []byte) (ed25519.PrivateKey, error) {
 	if v, err := strconv.ParseBool(os.Getenv("BUILDKIT_NO_CLIENT_TOKEN")); err == nil && v {
 		return nil, status.Errorf(codes.Unavailable, "client side tokens disabled")
 	}
 
-	creds, err := ap.credentials(host)
+	ac, err := ap.getAuthConfig(ctx, host, nil, ap.expireAc)
 	if err != nil {
 		return nil, err
 	}
+
+	creds := toCredentials(*ac)
 	seed, err := ap.seeds.getSeed(host)
 	if err != nil {
 		return nil, err
@@ -191,8 +338,6 @@ func (ap *authProvider) getAuthorityKey(host string, salt []byte) (ed25519.Priva
 	mac := hmac.New(sha256.New, salt)
 	if creds.Secret != "" {
 		mac.Write(seed)
-		enc := json.NewEncoder(mac)
-		enc.Encode(creds)
 	}
 
 	sum := mac.Sum(nil)
@@ -201,6 +346,9 @@ func (ap *authProvider) getAuthorityKey(host string, salt []byte) (ed25519.Priva
 }
 
 func toTokenResponse(token string, issuedAt time.Time, expires int) *auth.FetchTokenResponse {
+	if expires == 0 {
+		expires = defaultExpiration
+	}
 	resp := &auth.FetchTokenResponse{
 		Token:     token,
 		ExpiresIn: int64(expires),

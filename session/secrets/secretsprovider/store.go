@@ -2,7 +2,6 @@ package secretsprovider
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 
 	"github.com/moby/buildkit/session/secrets"
@@ -20,7 +19,7 @@ func NewStore(files []Source) (secrets.SecretStore, error) {
 	m := map[string]Source{}
 	for _, f := range files {
 		if f.ID == "" {
-			return nil, errors.Errorf("secret missing ID")
+			return nil, errors.New("secret missing ID")
 		}
 		if f.Env == "" && f.FilePath == "" {
 			if _, ok := os.LookupEnv(f.ID); ok {
@@ -57,7 +56,7 @@ func (fs *fileStore) GetSecret(ctx context.Context, id string) ([]byte, error) {
 	if v.Env != "" {
 		return []byte(os.Getenv(v.Env)), nil
 	}
-	dt, err := ioutil.ReadFile(v.FilePath)
+	dt, err := os.ReadFile(v.FilePath)
 	if err != nil {
 		return nil, err
 	}

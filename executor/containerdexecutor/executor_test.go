@@ -3,14 +3,14 @@ package containerdexecutor
 import (
 	"testing"
 
-	"github.com/containerd/containerd"
-	"github.com/moby/buildkit/frontend/gateway/errdefs"
+	ctd "github.com/containerd/containerd/v2/client"
+	gatewayapi "github.com/moby/buildkit/frontend/gateway/pb"
 )
 
 func TestContainerdUnknownExitStatus(t *testing.T) {
 	// There are assumptions in the containerd executor that the UnknownExitStatus
 	// used in errdefs.ExitError matches the variable in the containerd package.
-	if containerd.UnknownExitStatus != errdefs.UnknownExitStatus {
-		t.Fatalf("containerd.UnknownExitStatus != errdefs.UnknownExitStatus")
+	if ctd.UnknownExitStatus != gatewayapi.UnknownExitStatus {
+		t.Fatal("containerd.UnknownExitStatus != errdefs.UnknownExitStatus")
 	}
 }

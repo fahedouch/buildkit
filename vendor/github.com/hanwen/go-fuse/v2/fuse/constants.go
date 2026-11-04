@@ -18,6 +18,9 @@ const (
 
 	FUSE_LK_FLOCK = (1 << 0)
 
+	FUSE_RELEASE_FLUSH        = (1 << 0)
+	FUSE_RELEASE_FLOCK_UNLOCK = (1 << 1)
+
 	FUSE_IOCTL_MAX_IOV = 256
 
 	FUSE_POLL_SCHEDULE_NOTIFY = (1 << 0)
@@ -33,5 +36,9 @@ const (
 
 	O_ANYWRITE = uint32(os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREATE | os.O_TRUNC)
 
-	logicalBlockSize = 512
+	// FMODE_EXEC is a passed to OPEN requests if the file is
+	// being executed.
+	FMODE_EXEC = 0x20
+
+	logicalBlockSize = 4096
 )

@@ -1,27 +1,28 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v3"
 )
 
-var dialStdioCommand = cli.Command{
+var dialStdioCommand = &cli.Command{
 	Name:   "dial-stdio",
 	Usage:  "Proxy the stdio stream to the daemon connection. Should not be invoked manually.",
 	Hidden: true,
-	Action: dialStdioAction,
+	Action: commandAction(dialStdioAction),
 }
 
-func dialStdioAction(clicontext *cli.Context) error {
-	addr := clicontext.GlobalString("addr")
-	timeout := time.Duration(clicontext.GlobalInt("timeout")) * time.Second
+func dialStdioAction(clicontext *cli.Command) error {
+	addr := clicontext.String("addr")
+	timeout := time.Duration(clicontext.Int("timeout")) * time.Second
 	conn, err := dialer(addr, timeout)
 	if err != nil {
 		return err
@@ -68,16 +69,17 @@ func dialer(address string, timeout time.Duration) (net.Conn, error) {
 	if addrParts[0] != "unix" {
 		return nil, errors.Errorf("invalid address %s (expected unix://, got %s://)", address, addrParts[0])
 	}
-	return net.DialTimeout(addrParts[0], addrParts[1], timeout)
+	dialer := net.Dialer{Timeout: timeout}
+	return dialer.DialContext(context.TODO(), addrParts[0], addrParts[1])
 }
 
 func copier(to halfWriteCloser, from halfReadCloser, debugDescription string) error {
 	defer func() {
 		if err := from.CloseRead(); err != nil {
-			logrus.Errorf("error while CloseRead (%s): %v", debugDescription, err)
+			bklog.L.Errorf("error while CloseRead (%s): %v", debugDescription, err)
 		}
 		if err := to.CloseWrite(); err != nil {
-			logrus.Errorf("error while CloseWrite (%s): %v", debugDescription, err)
+			bklog.L.Errorf("error while CloseWrite (%s): %v", debugDescription, err)
 		}
 	}()
 	if _, err := io.Copy(to, from); err != nil {

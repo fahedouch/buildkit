@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,11 +15,11 @@ import (
 )
 
 func NewRegistry(dir string) (url string, cl func() error, err error) {
-	if err := lookupBinary("registry"); err != nil {
+	if err := LookupBinary("registry"); err != nil {
 		return "", nil, err
 	}
 
-	deferF := &multiCloser{}
+	deferF := &MultiCloser{}
 	cl = deferF.F()
 
 	defer func() {
@@ -31,15 +30,21 @@ func NewRegistry(dir string) (url string, cl func() error, err error) {
 	}()
 
 	if dir == "" {
-		tmpdir, err := ioutil.TempDir("", "test-registry")
+		tmpdir, err := os.MkdirTemp("", "test-registry")
 		if err != nil {
 			return "", nil, err
 		}
-		deferF.append(func() error { return os.RemoveAll(tmpdir) })
+		deferF.Append(func() error { return os.RemoveAll(tmpdir) })
 		dir = tmpdir
 	}
 
-	if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err != nil {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return "", nil, errors.WithStack(err)
+	}
+	defer root.Close()
+
+	if _, err := root.Stat("config.yaml"); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return "", nil, err
 		}
@@ -52,24 +57,25 @@ http:
     addr: 127.0.0.1:0
 `, filepath.Join(dir, "data"))
 
-		if err := ioutil.WriteFile(filepath.Join(dir, "config.yaml"), []byte(template), 0600); err != nil {
+		if err := root.WriteFile("config.yaml", []byte(template), 0600); err != nil {
 			return "", nil, err
 		}
 	}
 
-	cmd := exec.Command("registry", "serve", filepath.Join(dir, "config.yaml"))
+	cmd := exec.CommandContext(context.TODO(), "registry", "serve", filepath.Join(dir, "config.yaml")) //nolint:gosec // test utility
 	rc, err := cmd.StderrPipe()
 	if err != nil {
 		return "", nil, err
 	}
-	stop, err := startCmd(cmd, nil)
+	stop, err := StartCmd(cmd, nil)
 	if err != nil {
 		return "", nil, err
 	}
-	deferF.append(stop)
+	deferF.Append(stop)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	ctx, _ = context.WithTimeoutCause(ctx, 5*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 	url, err = detectPort(ctx, rc)
 	if err != nil {
 		return "", nil, err
@@ -84,7 +90,7 @@ func detectPort(ctx context.Context, rc io.ReadCloser) (string, error) {
 	found := make(chan struct{})
 	defer func() {
 		close(found)
-		go io.Copy(ioutil.Discard, rc)
+		go io.Copy(io.Discard, rc)
 	}()
 
 	go func() {
@@ -106,5 +112,5 @@ func detectPort(ctx context.Context, rc io.ReadCloser) (string, error) {
 			return "localhost:" + string(res[1]), nil
 		}
 	}
-	return "", errors.Errorf("no listening address found")
+	return "", errors.New("no listening address found")
 }

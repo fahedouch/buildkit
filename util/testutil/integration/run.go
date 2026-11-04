@@ -4,25 +4,31 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"maps"
+	"math"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/platforms"
+	"github.com/docker/cli/cli/config"
 	"github.com/gofrs/flock"
+	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/contentutil"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/semaphore"
 )
@@ -36,36 +42,82 @@ func init() {
 // Backend is the minimal interface that describes a testing backend.
 type Backend interface {
 	Address() string
+	DockerAddress() string
 	ContainerdAddress() string
+	DebugAddress() string
+
 	Rootless() bool
+	NetNSDetached() bool
 	Snapshotter() string
+	ExtraEnv() []string
+	Supports(feature string) bool
 }
 
 type Sandbox interface {
 	Backend
 
+	Context() context.Context
 	Cmd(...string) *exec.Cmd
+	Logs() map[string]*bytes.Buffer
 	PrintLogs(*testing.T)
+	ClearLogs()
 	NewRegistry() (string, error)
-	Value(string) interface{} // chosen matrix value
+	Value(string) any // chosen matrix value
+	Name() string
+	CDISpecDir() string
 }
 
 // BackendConfig is used to configure backends created by a worker.
 type BackendConfig struct {
-	Logs       map[string]*bytes.Buffer
-	ConfigFile string
+	Logs         map[string]*bytes.Buffer
+	DaemonConfig []ConfigUpdater
+	CDISpecDir   string
 }
 
 type Worker interface {
-	New(*BackendConfig) (Backend, func() error, error)
+	New(context.Context, *BackendConfig) (Backend, func() error, error)
+	Close() error
 	Name() string
+	Rootless() bool
+	NetNSDetached() bool
 }
 
 type ConfigUpdater interface {
-	UpdateConfigFile(string) string
+	UpdateConfigFile(string) (string, func() error)
 }
 
-type Test func(*testing.T, Sandbox)
+type Test interface {
+	Name() string
+	Run(t *testing.T, sb Sandbox)
+}
+
+type testFunc struct {
+	name string
+	run  func(t *testing.T, sb Sandbox)
+}
+
+func (f testFunc) Name() string {
+	return f.name
+}
+
+func (f testFunc) Run(t *testing.T, sb Sandbox) {
+	t.Helper()
+	f.run(t, sb)
+}
+
+func TestFuncs(funcs ...func(t *testing.T, sb Sandbox)) []Test {
+	var tests []Test
+	names := map[string]struct{}{}
+	for _, f := range funcs {
+		name := getFunctionName(f)
+		if _, ok := names[name]; ok {
+			panic("duplicate test: " + name)
+		}
+		names[name] = struct{}{}
+		tests = append(tests, testFunc{name: name, run: f})
+	}
+	return tests
+}
 
 var defaultWorkers []Worker
 
@@ -81,10 +133,10 @@ func List() []Worker {
 // tests.
 type TestOpt func(*testConf)
 
-func WithMatrix(key string, m map[string]interface{}) TestOpt {
+func WithMatrix(key string, m map[string]any) TestOpt {
 	return func(tc *testConf) {
 		if tc.matrix == nil {
-			tc.matrix = map[string]map[string]interface{}{}
+			tc.matrix = map[string]map[string]any{}
 		}
 		tc.matrix[key] = m
 	}
@@ -95,14 +147,12 @@ func WithMirroredImages(m map[string]string) TestOpt {
 		if tc.mirroredImages == nil {
 			tc.mirroredImages = map[string]string{}
 		}
-		for k, v := range m {
-			tc.mirroredImages[k] = v
-		}
+		maps.Copy(tc.mirroredImages, m)
 	}
 }
 
 type testConf struct {
-	matrix         map[string]map[string]interface{}
+	matrix         map[string]map[string]any
 	mirroredImages map[string]string
 }
 
@@ -115,60 +165,92 @@ func Run(t *testing.T, testCases []Test, opt ...TestOpt) {
 		t.Skip("skipping integration tests")
 	}
 
+	var sliceSplit int
+	if filter, ok := lookupTestFilter(); ok {
+		parts := strings.Split(filter, "/")
+		if len(parts) >= 2 {
+			const prefix = "slice="
+			if after, ok0 := strings.CutPrefix(parts[1], prefix); ok0 {
+				conf := after
+				offsetS, totalS, ok := strings.Cut(conf, "-")
+				if !ok {
+					t.Fatalf("invalid slice=%q", conf)
+				}
+				offset, err := strconv.Atoi(offsetS)
+				require.NoError(t, err)
+				total, err := strconv.Atoi(totalS)
+				require.NoError(t, err)
+				if offset < 1 || total < 1 || offset > total {
+					t.Fatalf("invalid slice=%q", conf)
+				}
+				sliceSplit = total
+			}
+		}
+	}
+
 	var tc testConf
 	for _, o := range opt {
 		o(&tc)
 	}
 
-	mirror, cleanup, err := runMirror(t, tc.mirroredImages)
-	require.NoError(t, err)
-
-	var mu sync.Mutex
-	var count int
-	cleanOnComplete := func() func() {
-		count++
-		return func() {
-			mu.Lock()
-			count--
-			if count == 0 {
-				cleanup()
-			}
-			mu.Unlock()
-		}
-	}
-	defer cleanOnComplete()()
+	getMirror := lazyMirrorRunnerFunc(t, tc.mirroredImages)
 
 	matrix := prepareValueMatrix(tc)
 
 	list := List()
 	if os.Getenv("BUILDKIT_WORKER_RANDOM") == "1" && len(list) > 0 {
-		rand.Seed(time.Now().UnixNano())
-		list = []Worker{list[rand.Intn(len(list))]}
+		rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // using math/rand is fine in a test utility
+		list = []Worker{list[rng.Intn(len(list))]}
 	}
+	t.Cleanup(func() {
+		for _, br := range list {
+			_ = br.Close()
+		}
+	})
 
 	for _, br := range list {
-		for _, tc := range testCases {
+		for i, tc := range testCases {
 			for _, mv := range matrix {
-				fn := getFunctionName(tc)
+				fn := tc.Name()
+				if sliceSplit > 0 {
+					pageLimit := int(math.Ceil(float64(len(testCases)) / float64(sliceSplit)))
+					sliceName := fmt.Sprintf("slice=%d-%d/", i/pageLimit+1, sliceSplit)
+					fn = sliceName + fn
+				}
 				name := fn + "/worker=" + br.Name() + mv.functionSuffix()
 				func(fn, testName string, br Worker, tc Test, mv matrixValue) {
 					ok := t.Run(testName, func(t *testing.T) {
-						defer cleanOnComplete()()
-						if !strings.HasSuffix(fn, "NoParallel") {
+						if strings.Contains(fn, "NoRootless") && br.Rootless() {
+							// skip sandbox setup
+							t.Skip("rootless")
+						}
+						ctx := appcontext.Context()
+						// TODO(profnandaa): to revisit this to allow tests run
+						// in parallel on Windows in a stable way. Is flaky currently.
+						if !strings.HasSuffix(fn, "NoParallel") && runtime.GOOS != "windows" {
 							t.Parallel()
 						}
-						require.NoError(t, sandboxLimiter.Acquire(context.TODO(), 1))
+						require.NoError(t, sandboxLimiter.Acquire(t.Context(), 1))
 						defer sandboxLimiter.Release(1)
 
-						sb, closer, err := newSandbox(br, mirror, mv)
+						ctx, cancel := context.WithCancelCause(ctx)
+						defer func() { cancel(errors.WithStack(context.Canceled)) }()
+
+						sb, closer, err := newSandbox(ctx, t, br, getMirror(ctx), mv)
 						require.NoError(t, err)
+						t.Cleanup(func() {
+							if closer != nil {
+								_ = closer()
+							}
+						})
 						defer func() {
-							assert.NoError(t, closer())
 							if t.Failed() {
+								closer()
+								closer = nil // don't call again
 								sb.PrintLogs(t)
 							}
 						}()
-						tc(t, sb)
+						tc.Run(t, sb)
 					})
 					require.True(t, ok)
 				}(fn, name, br, tc, mv)
@@ -177,15 +259,18 @@ func Run(t *testing.T, testCases []Test, opt ...TestOpt) {
 	}
 }
 
-func getFunctionName(i interface{}) string {
+func getFunctionName(i any) string {
 	fullname := runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
 	dot := strings.LastIndex(fullname, ".") + 1
-	return strings.Title(fullname[dot:])
+	return strings.Title(fullname[dot:]) //nolint:staticcheck // ignoring "SA1019: strings.Title is deprecated", as for our use we don't need full unicode support
 }
 
 var localImageCache map[string]map[string]struct{}
+var localImageCacheMu sync.Mutex
 
-func copyImagesLocal(t *testing.T, host string, images map[string]string) error {
+func copyImagesLocal(ctx context.Context, t *testing.T, host string, images map[string]string) error {
+	localImageCacheMu.Lock()
+	defer localImageCacheMu.Unlock()
 	for to, from := range images {
 		if localImageCache == nil {
 			localImageCache = map[string]map[string]struct{}{}
@@ -198,7 +283,12 @@ func copyImagesLocal(t *testing.T, host string, images map[string]string) error 
 		}
 		localImageCache[host][to] = struct{}{}
 
-		var desc ocispec.Descriptor
+		// already exists check
+		if _, _, err := docker.NewResolver(docker.ResolverOptions{}).Resolve(ctx, host+"/"+to); err == nil {
+			continue
+		}
+
+		var desc ocispecs.Descriptor
 		var provider content.Provider
 		var err error
 		if strings.HasPrefix(from, "local:") {
@@ -211,16 +301,31 @@ func copyImagesLocal(t *testing.T, host string, images map[string]string) error 
 				defer closer()
 			}
 		} else {
-			desc, provider, err = contentutil.ProviderFromRef(from)
+			dockerConfig := config.LoadDefaultConfigFile(os.Stderr)
+
+			desc, provider, err = contentutil.ProviderFromRef(ctx, from, contentutil.WithCredentials(
+				func(host string) (string, string, error) {
+					ac, err := dockerConfig.GetAuthConfig(host)
+					if err != nil {
+						return "", "", err
+					}
+					return ac.Username, ac.Password, nil
+				}))
 			if err != nil {
 				return err
 			}
 		}
-		ingester, err := contentutil.IngesterFromRef(host + "/" + to)
+
+		desc, err = resolveDefaultPlatform(ctx, provider, desc)
 		if err != nil {
 			return err
 		}
-		if err := contentutil.CopyChain(context.TODO(), ingester, provider, desc); err != nil {
+
+		ingester, err := contentutil.IngesterFromRef(ctx, host+"/"+to)
+		if err != nil {
+			return err
+		}
+		if err := contentutil.CopyChain(ctx, ingester, provider, desc); err != nil {
 			return err
 		}
 		t.Logf("copied %s to local mirror %s", from, host+"/"+to)
@@ -228,18 +333,28 @@ func copyImagesLocal(t *testing.T, host string, images map[string]string) error 
 	return nil
 }
 
+// resolveDefaultPlatform resolves a multi-platform index descriptor to a
+// single-platform manifest descriptor matching the current platform.
+// If the descriptor is not an index, it is returned as-is.
+func resolveDefaultPlatform(ctx context.Context, provider content.Provider, desc ocispecs.Descriptor) (ocispecs.Descriptor, error) {
+	if !images.IsIndexType(desc.MediaType) {
+		return desc, nil
+	}
+	children, err := images.Children(ctx, provider, desc)
+	if err != nil {
+		return ocispecs.Descriptor{}, err
+	}
+	matcher := platforms.OnlyStrict(platforms.DefaultSpec())
+	for _, c := range children {
+		if c.Platform != nil && matcher.Match(*c.Platform) {
+			return c, nil
+		}
+	}
+	return ocispecs.Descriptor{}, errors.Errorf("no manifest matching platform %s in index %s", platforms.Format(platforms.DefaultSpec()), desc.Digest)
+}
+
 func OfficialImages(names ...string) map[string]string {
-	ns := runtime.GOARCH
-	if ns == "arm64" {
-		ns = "arm64v8"
-	} else if ns != "amd64" && ns != "armhf" {
-		ns = "library"
-	}
-	m := map[string]string{}
-	for _, name := range names {
-		m["library/"+name] = "docker.io/" + ns + "/" + name
-	}
-	return m
+	return officialImages(names...)
 }
 
 func withMirrorConfig(mirror string) ConfigUpdater {
@@ -248,53 +363,124 @@ func withMirrorConfig(mirror string) ConfigUpdater {
 
 type mirrorConfig string
 
-func (mc mirrorConfig) UpdateConfigFile(in string) string {
+func (mc mirrorConfig) UpdateConfigFile(in string) (string, func() error) {
 	return fmt.Sprintf(`%s
 
 [registry."docker.io"]
 mirrors=["%s"]
-`, in, mc)
+`, in, mc), nil
 }
 
-func writeConfig(updaters []ConfigUpdater) (string, error) {
-	tmpdir, err := ioutil.TempDir("", "bktest_config")
-	if err != nil {
-		return "", err
-	}
-	if err := os.Chmod(tmpdir, 0711); err != nil {
-		return "", err
-	}
-
-	s := ""
-	for _, upt := range updaters {
-		s = upt.UpdateConfigFile(s)
-	}
-
-	if err := ioutil.WriteFile(filepath.Join(tmpdir, buildkitdConfigFile), []byte(s), 0644); err != nil {
-		return "", err
-	}
-	return tmpdir, nil
-}
-
-func runMirror(t *testing.T, mirroredImages map[string]string) (host string, _ func() error, err error) {
-	mirrorDir := os.Getenv("BUILDKIT_REGISTRY_MIRROR_DIR")
-
-	var lock *flock.Flock
-	if mirrorDir != "" {
-		lock = flock.New(filepath.Join(mirrorDir, "lock"))
-		if err := lock.Lock(); err != nil {
-			return "", nil, err
-		}
-		defer func() {
-			if err != nil {
-				lock.Unlock()
-			}
-		}()
-	}
-
-	mirror, cleanup, err := NewRegistry(mirrorDir)
+func WriteConfig(updaters []ConfigUpdater) (_ string, _ func() error, err error) {
+	tmpdir, err := os.MkdirTemp("", "bktest_config")
 	if err != nil {
 		return "", nil, err
+	}
+	if err := os.Chmod(tmpdir, 0711); err != nil {
+		return "", nil, err
+	}
+
+	deferF := &MultiCloser{}
+	s := ""
+	for _, upt := range updaters {
+		var release func() error
+		s, release = upt.UpdateConfigFile(s)
+		if release != nil {
+			deferF.Append(release)
+		}
+	}
+
+	defer func() {
+		if err != nil {
+			deferF.F()()
+		}
+	}()
+
+	if err := os.WriteFile(filepath.Join(tmpdir, buildkitdConfigFile), []byte(s), 0644); err != nil {
+		return "", nil, err
+	}
+	return filepath.Join(tmpdir, buildkitdConfigFile), deferF.F(), nil
+}
+
+func lazyMirrorRunnerFunc(t *testing.T, images map[string]string) func(context.Context) string {
+	var once sync.Once
+	var mirror string
+	return func(ctx context.Context) string {
+		once.Do(func() {
+			m, err := RunMirror()
+			require.NoError(t, err)
+			require.NoError(t, m.AddImages(ctx, t, images))
+			t.Cleanup(func() { _ = m.Close() })
+			mirror = m.Host
+		})
+		return mirror
+	}
+}
+
+type Mirror struct {
+	Host    string
+	dir     string
+	cleanup func() error
+}
+
+func (m *Mirror) lock() (*flock.Flock, error) {
+	if m.dir == "" {
+		return nil, nil
+	}
+	if err := os.MkdirAll(m.dir, 0700); err != nil {
+		return nil, err
+	}
+	lock := flock.New(filepath.Join(m.dir, "lock"))
+	if err := lock.Lock(); err != nil {
+		return nil, err
+	}
+	return lock, nil
+}
+
+func (m *Mirror) Close() error {
+	if m.cleanup != nil {
+		return m.cleanup()
+	}
+	return nil
+}
+
+func (m *Mirror) AddImages(ctx context.Context, t *testing.T, images map[string]string) (err error) {
+	lock, err := m.lock()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if lock != nil {
+			lock.Unlock()
+		}
+	}()
+
+	if err := copyImagesLocal(ctx, t, m.Host, images); err != nil {
+		return err
+	}
+	return nil
+}
+
+func RunMirror() (_ *Mirror, err error) {
+	mirrorDir := os.Getenv("BUILDKIT_REGISTRY_MIRROR_DIR")
+
+	m := &Mirror{
+		dir: mirrorDir,
+	}
+
+	lock, err := m.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil && lock != nil {
+			_ = lock.Unlock()
+		}
+	}()
+
+	host, cleanup, err := NewRegistry(mirrorDir)
+	if err != nil {
+		return nil, err
 	}
 	defer func() {
 		if err != nil {
@@ -302,17 +488,16 @@ func runMirror(t *testing.T, mirroredImages map[string]string) (host string, _ f
 		}
 	}()
 
-	if err := copyImagesLocal(t, mirror, mirroredImages); err != nil {
-		return "", nil, err
-	}
+	m.Host = host
+	m.cleanup = cleanup
 
-	if mirrorDir != "" {
+	if lock != nil {
 		if err := lock.Unlock(); err != nil {
-			return "", nil, err
+			return nil, err
 		}
 	}
 
-	return mirror, cleanup, err
+	return m, err
 }
 
 type matrixValue struct {
@@ -324,7 +509,7 @@ func (mv matrixValue) functionSuffix() string {
 	if len(mv.fn) == 0 {
 		return ""
 	}
-	sort.Strings(mv.fn)
+	slices.Sort(mv.fn)
 	sb := &strings.Builder{}
 	for _, f := range mv.fn {
 		sb.Write([]byte("/" + f + "=" + mv.values[f].name))
@@ -334,10 +519,10 @@ func (mv matrixValue) functionSuffix() string {
 
 type matrixValueChoice struct {
 	name  string
-	value interface{}
+	value any
 }
 
-func newMatrixValue(key, name string, v interface{}) matrixValue {
+func newMatrixValue(key, name string, v any) matrixValue {
 	return matrixValue{
 		fn: []string{key},
 		values: map[string]matrixValueChoice{
@@ -361,9 +546,7 @@ func prepareValueMatrix(tc testConf) []matrixValue {
 			for _, c := range current {
 				vv := newMatrixValue(featureName, featureValue, v)
 				vv.fn = append(vv.fn, c.fn...)
-				for k, v := range c.values {
-					vv.values[k] = v
-				}
+				maps.Copy(vv.values, c.values)
 				m = append(m, vv)
 			}
 		}
@@ -374,43 +557,42 @@ func prepareValueMatrix(tc testConf) []matrixValue {
 	return m
 }
 
-func runStargzSnapshotter(cfg *BackendConfig) (address string, cl func() error, err error) {
-	binary := "containerd-stargz-grpc"
-	if err := lookupBinary(binary); err != nil {
-		return "", nil, err
+// Skips tests on platform
+func SkipOnPlatform(t *testing.T, goos string, reason ...string) {
+	skip := false
+	// support for negation
+	if after, ok := strings.CutPrefix(goos, "!"); ok {
+		goos = after
+		skip = runtime.GOOS != goos
+	} else {
+		skip = runtime.GOOS == goos
 	}
 
-	deferF := &multiCloser{}
-	cl = deferF.F()
-
-	defer func() {
-		if err != nil {
-			deferF.F()()
-			cl = nil
+	if skip {
+		if len(reason) > 0 {
+			t.Skipf("Skipped on %s: %s", goos, strings.Join(reason, " "))
+		} else {
+			t.Skipf("Skipped on %s", goos)
 		}
-	}()
-
-	tmpStargzDir, err := ioutil.TempDir("", "bktest_containerd_stargz_grpc")
-	if err != nil {
-		return "", nil, err
 	}
-	deferF.append(func() error { return os.RemoveAll(tmpStargzDir) })
+}
 
-	address = filepath.Join(tmpStargzDir, "containerd-stargz-grpc.sock")
-	stargzRootDir := filepath.Join(tmpStargzDir, "root")
-	cmd := exec.Command(binary,
-		"--log-level", "debug",
-		"--address", address,
-		"--root", stargzRootDir)
-	snStop, err := startCmd(cmd, cfg.Logs)
-	if err != nil {
-		return "", nil, err
+// Selects between two types, returns second
+// argument if on Windows or else first argument.
+// Typically used for selecting test cases.
+func UnixOrWindows[T any](unix, windows T) T {
+	if runtime.GOOS == "windows" {
+		return windows
 	}
-	if err = waitUnix(address, 10*time.Second); err != nil {
-		snStop()
-		return "", nil, errors.Wrapf(err, "containerd-stargz-grpc did not start up: %s", formatLogs(cfg.Logs))
-	}
-	deferF.append(snStop)
+	return unix
+}
 
-	return
+func lookupTestFilter() (string, bool) {
+	const prefix = "-test.run="
+	for _, arg := range os.Args {
+		if after, ok := strings.CutPrefix(arg, prefix); ok {
+			return after, true
+		}
+	}
+	return "", false
 }

@@ -4,31 +4,39 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/moby/buildkit/client"
 	bccommon "github.com/moby/buildkit/cmd/buildctl/common"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/tonistiigi/units"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v3"
 )
 
-var diskUsageCommand = cli.Command{
+var diskUsageCommand = &cli.Command{
 	Name:   "du",
 	Usage:  "disk usage",
-	Action: diskUsage,
+	Action: commandAction(diskUsage),
 	Flags: []cli.Flag{
-		cli.StringSliceFlag{
-			Name:  "filter, f",
-			Usage: "Filter records",
+		&cli.StringSliceFlag{
+			Name:    "filter",
+			Aliases: []string{"f"},
+			Usage:   "Filter records",
 		},
-		cli.BoolFlag{
-			Name:  "verbose, v",
-			Usage: "Verbose output",
+		&cli.BoolFlag{
+			Name:    "verbose",
+			Aliases: []string{"v"},
+			Usage:   "Verbose output",
+		},
+		&cli.StringFlag{
+			Name:  "format",
+			Usage: "Format the output using the given Go template, e.g, '{{json .}}'",
 		},
 	},
 }
 
-func diskUsage(clicontext *cli.Context) error {
+func diskUsage(clicontext *cli.Command) error {
 	c, err := bccommon.ResolveClient(clicontext)
 	if err != nil {
 		return err
@@ -36,6 +44,21 @@ func diskUsage(clicontext *cli.Context) error {
 
 	du, err := c.DiskUsage(bccommon.CommandContext(clicontext), client.WithFilter(clicontext.StringSlice("filter")))
 	if err != nil {
+		return err
+	}
+
+	if format := clicontext.String("format"); format != "" {
+		if clicontext.Bool("verbose") {
+			bklog.L.Debug("Ignoring --verbose")
+		}
+		tmpl, err := bccommon.ParseTemplate(format)
+		if err != nil {
+			return err
+		}
+		if err := tmpl.Execute(clicontext.Root().Writer, du); err != nil {
+			return err
+		}
+		_, err = fmt.Fprint(clicontext.Root().Writer, "\n")
 		return err
 	}
 
@@ -54,15 +77,15 @@ func diskUsage(clicontext *cli.Context) error {
 	return nil
 }
 
-func printKV(w io.Writer, k string, v interface{}) {
+func printKV(w io.Writer, k string, v any) {
 	fmt.Fprintf(w, "%s:\t%v\n", k, v)
 }
 
 func printVerbose(tw *tabwriter.Writer, du []*client.UsageInfo) {
 	for _, di := range du {
 		printKV(tw, "ID", di.ID)
-		if di.Parent != "" {
-			printKV(tw, "Parent", di.Parent)
+		if len(di.Parents) > 0 {
+			printKV(tw, "Parents", strings.Join(di.Parents, ";"))
 		}
 		printKV(tw, "Created at", di.CreatedAt)
 		printKV(tw, "Mutable", di.Mutable)
@@ -80,7 +103,7 @@ func printVerbose(tw *tabwriter.Writer, du []*client.UsageInfo) {
 			printKV(tw, "Type", di.RecordType)
 		}
 
-		fmt.Fprintf(tw, "\n")
+		fmt.Fprint(tw, "\n")
 	}
 
 	tw.Flush()

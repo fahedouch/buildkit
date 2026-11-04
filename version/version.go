@@ -17,12 +17,16 @@
 
 package version
 
+const (
+	defaultVersion = "v0.0.0+unknown"
+)
+
 var (
 	// Package is filled at linking time
 	Package = "github.com/moby/buildkit"
 
 	// Version holds the complete version number. Filled in at linking time.
-	Version = "0.0.0+unknown"
+	Version = defaultVersion
 
 	// Revision is filled with the VCS (e.g. git) revision being used to build
 	// the program at linking time.

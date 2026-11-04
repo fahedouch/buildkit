@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"time"
 )
@@ -12,11 +13,11 @@ import (
 type TestServer struct {
 	*httptest.Server
 	mu     sync.Mutex
-	routes map[string]Response
+	routes map[string]*Response
 	stats  map[string]*Stat
 }
 
-func NewTestServer(routes map[string]Response) *TestServer {
+func NewTestServer(routes map[string]*Response) *TestServer {
 	ts := &TestServer{
 		routes: routes,
 		stats:  map[string]*Stat{},
@@ -25,7 +26,7 @@ func NewTestServer(routes map[string]Response) *TestServer {
 	return ts
 }
 
-func (s *TestServer) SetRoute(name string, resp Response) {
+func (s *TestServer) SetRoute(name string, resp *Response) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.routes[name] = resp
@@ -45,9 +46,18 @@ func (s *TestServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.stats[r.URL.Path].AllRequests++
+	s.stats[r.URL.Path].Requests = append(s.stats[r.URL.Path].Requests, newRequest(r))
 
 	if resp.LastModified != nil {
 		w.Header().Set("Last-Modified", resp.LastModified.Format(time.RFC850))
+	}
+
+	if resp.ContentEncoding != "" {
+		w.Header().Set("Content-Encoding", resp.ContentEncoding)
+	}
+
+	if resp.ContentDisposition != "" {
+		w.Header().Set("Content-Disposition", resp.ContentDisposition)
 	}
 
 	if resp.Etag != "" {
@@ -74,11 +84,30 @@ func (s *TestServer) Stats(name string) (st Stat) {
 }
 
 type Response struct {
-	Content      []byte
-	Etag         string
-	LastModified *time.Time
+	Content            []byte
+	Etag               string
+	LastModified       *time.Time
+	ContentEncoding    string
+	ContentDisposition string
 }
 
 type Stat struct {
 	AllRequests, CachedRequests int
+	Requests                    []Request
+}
+
+type Request struct {
+	Method string
+	Header http.Header
+}
+
+func newRequest(r *http.Request) Request {
+	headers := http.Header{}
+	for k, v := range r.Header {
+		headers[k] = slices.Clone(v)
+	}
+	return Request{
+		Method: r.Method,
+		Header: headers,
+	}
 }

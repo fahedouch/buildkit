@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 /*
    Copyright The containerd Authors.
@@ -19,9 +19,11 @@
 package fstest
 
 import (
+	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/containerd/continuity/devices"
 	"github.com/containerd/continuity/sysx"
 	"golang.org/x/sys/unix"
 )
@@ -29,7 +31,8 @@ import (
 // SetXAttr sets the xatter for the file
 func SetXAttr(name, key, value string) Applier {
 	return applyFn(func(root string) error {
-		return sysx.LSetxattr(name, key, []byte(value), 0)
+		path := filepath.Join(root, name)
+		return sysx.LSetxattr(path, key, []byte(value), 0)
 	})
 }
 
@@ -41,6 +44,14 @@ func Lchtimes(name string, atime, mtime time.Time) Applier {
 		mt := unix.NsecToTimespec(mtime.UnixNano())
 		utimes := [2]unix.Timespec{at, mt}
 		return unix.UtimesNanoAt(unix.AT_FDCWD, path, utimes[0:], unix.AT_SYMLINK_NOFOLLOW)
+	})
+}
+
+// CreateDeviceFile provides creates devices Applier.
+func CreateDeviceFile(name string, mode os.FileMode, major, minor int) Applier {
+	return applyFn(func(root string) error {
+		fullPath := filepath.Join(root, name)
+		return devices.Mknod(fullPath, mode, major, minor)
 	})
 }
 
